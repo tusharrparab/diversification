@@ -28,6 +28,8 @@ suppressPackageStartupMessages({
 tree_file <- "data/raw/pruned_phylogeny.nex"
 climate_file <- "data/raw/climate.csv"
 output_dir <- "results/ancestral_climate_reconstruction"
+precomputed_crown_file <- file.path(output_dir, "crown_ancestral_original_climate.csv")
+force_reconstruct_crown <- tolower(Sys.getenv("FORCE_RECONSTRUCT_CROWN", "false")) %in% c("1", "true", "yes")
 
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
 
@@ -356,23 +358,56 @@ loadings$PC2_precipitation <- loadings[[paste0("PC", pc2_idx)]] * pc2_sign
 
 crown_node <- as.character(Ntip(tree_pruned) + 1)
 
-crown_recon_list <- lapply(climate_vars, function(v) {
-  trait_vec <- clim_final[[v]]
-  names(trait_vec) <- clim_final$tree_label
+if (file.exists(precomputed_crown_file) && !force_reconstruct_crown) {
+  message("Using precomputed crown/root reconstruction: ", precomputed_crown_file)
+  crown_climate_df <- read_csv(precomputed_crown_file, show_col_types = FALSE)
 
-  anc <- fastAnc(tree_pruned, trait_vec, vars = TRUE, CI = TRUE)
+  if ("root_estimate" %in% names(crown_climate_df) && !"crown_estimate" %in% names(crown_climate_df)) {
+    crown_climate_df <- crown_climate_df %>% rename(crown_estimate = root_estimate)
+  }
+  if ("root_variance" %in% names(crown_climate_df) && !"crown_variance" %in% names(crown_climate_df)) {
+    crown_climate_df <- crown_climate_df %>% rename(crown_variance = root_variance)
+  }
+  if (!"crown_node" %in% names(crown_climate_df)) {
+    crown_climate_df <- crown_climate_df %>% mutate(crown_node = crown_node, .after = variable)
+  }
 
-  tibble(
-    variable = v,
-    crown_node = crown_node,
-    crown_estimate = as.numeric(anc$ace[crown_node]),
-    crown_variance = as.numeric(anc$var[crown_node]),
-    CI_low = as.numeric(anc$CI95[crown_node, 1]),
-    CI_high = as.numeric(anc$CI95[crown_node, 2])
-  )
-})
+  required_crown_cols <- c("variable", "crown_node", "crown_estimate", "crown_variance", "CI_low", "CI_high")
+  missing_crown_cols <- setdiff(required_crown_cols, names(crown_climate_df))
+  if (length(missing_crown_cols) > 0) {
+    stop("Precomputed crown file is missing columns: ", paste(missing_crown_cols, collapse = ", "))
+  }
 
-crown_climate_df <- bind_rows(crown_recon_list)
+  crown_climate_df <- crown_climate_df %>%
+    filter(variable %in% climate_vars) %>%
+    mutate(
+      variable = as.character(variable),
+      crown_node = as.character(crown_node),
+      crown_estimate = as.numeric(crown_estimate),
+      crown_variance = as.numeric(crown_variance),
+      CI_low = as.numeric(CI_low),
+      CI_high = as.numeric(CI_high)
+    ) %>%
+    slice(match(climate_vars, variable))
+} else {
+  crown_recon_list <- lapply(climate_vars, function(v) {
+    trait_vec <- clim_final[[v]]
+    names(trait_vec) <- clim_final$tree_label
+
+    anc <- fastAnc(tree_pruned, trait_vec, vars = TRUE, CI = TRUE)
+
+    tibble(
+      variable = v,
+      crown_node = crown_node,
+      crown_estimate = as.numeric(anc$ace[crown_node]),
+      crown_variance = as.numeric(anc$var[crown_node]),
+      CI_low = as.numeric(anc$CI95[crown_node, 1]),
+      CI_high = as.numeric(anc$CI95[crown_node, 2])
+    )
+  })
+
+  crown_climate_df <- bind_rows(crown_recon_list)
+}
 
 crown_climate <- crown_climate_df$crown_estimate
 names(crown_climate) <- crown_climate_df$variable
@@ -389,8 +424,8 @@ crown_scores_all <- as.numeric(crown_scaled %*% pca_vis$rotation)
 names(crown_scores_all) <- colnames(pca_vis$x)
 
 crown_center <- c(
-  PC1_thermal = crown_scores_all[paste0("PC", pc1_idx)] * pc1_sign,
-  PC2_precipitation = crown_scores_all[paste0("PC", pc2_idx)] * pc2_sign
+  PC1_thermal = unname(crown_scores_all[paste0("PC", pc1_idx)]) * pc1_sign,
+  PC2_precipitation = unname(crown_scores_all[paste0("PC", pc2_idx)]) * pc2_sign
 )
 
 crown_point <- tibble(
