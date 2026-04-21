@@ -1,7 +1,13 @@
 # Diversification
 
-This repository contains a reproducible ancestral climatic core analysis for the
-pruned bird phylogeny and climate table.
+This repository contains a reproducible ancestral climatic reconstruction
+workflow for birds.
+
+Result Block 1 asks: where did the radiation begin in climatic space?
+
+The pipeline is intentionally strict: ancestral climate is reconstructed in the
+original environmental variables, and PCA is used only afterward as a
+visualization space.
 
 ## Inputs
 
@@ -16,33 +22,46 @@ From the repository root:
 Rscript scripts/run_ancestral_climate_reconstruction.R
 ```
 
-The script reconstructs the crown/root climate on the original climate
-variables, projects that crown point into PCA climate space, and ranks extant
-species by their Mahalanobis distance to the projected crown climate. Because
-the exact `fastAnc(..., vars = TRUE, CI = TRUE)` reconstruction is slow on this
-large tree, the script reuses
-`results/ancestral_climate_reconstruction/crown_ancestral_original_climate.csv`
-when it is already present. To force a fresh full reconstruction:
+`geiger::fitContinuous()` can be slow on the full tree. To allow geiger to use
+more than one worker where supported:
 
 ```sh
-FORCE_RECONSTRUCT_CROWN=true Rscript scripts/run_ancestral_climate_reconstruction.R
+GEIGER_NCORES=4 Rscript scripts/run_ancestral_climate_reconstruction.R
 ```
+
+For smoke tests or alternate inputs, the paths can be overridden without
+editing the script:
+
+```sh
+TREE_FILE=/path/to/pruned_phylogeny.nex \
+CLIMATE_FILE=/path/to/climate.csv \
+OUTPUT_DIR=/tmp/strict_ancestral_climate_test \
+Rscript scripts/run_ancestral_climate_reconstruction.R
+```
+
+For each climate variable, the script fits BM, OU, EB, lambda, delta, and
+mean_trend with `geiger::fitContinuous()`. Primary ancestral reconstruction is
+restricted to BM, lambda, and delta. OU, EB, and mean_trend are sensitivity-only
+models: they can be the best AICc model, but they are not silently forced into
+the primary root ellipse.
+
+The output note in `SUMMARY.md` explicitly lists the remaining approximations,
+including diagonal uncertainty propagation from original variables into PCA
+space.
 
 ## Key Outputs
 
-- `results/ancestral_climate_reconstruction/crown_ancestral_original_climate.csv`
-- `results/ancestral_climate_reconstruction/crown_ancestral_projected_PCA_point.csv`
-- `results/ancestral_climate_reconstruction/ancestral_core_species_membership.csv`
-- `results/ancestral_climate_reconstruction/ancestral_core_summary.csv`
-- `results/ancestral_climate_reconstruction/ancestral_climatic_core.png`
-- `results/ancestral_climate_reconstruction/ancestral_climate_reconstruction_outputs.xlsx`
+Outputs are written to `results/result_block_1_strict_ancestral_climate/`.
 
-Current run summary:
-
-- Species used: 9,621
-- Crown node: 9,622
-- Thermal axis: PC1
-- Precipitation axis: PC4
-- Species inside 50% ancestral core: 5,365
-- Species inside 80% ancestral core: 7,990
-- Species inside 95% ancestral core: 8,843
+- `strict_model_fits_by_variable.csv`
+- `strict_ancestral_reconstruction_by_variable.csv`
+- `strict_root_vector_for_PCA_projection.csv`
+- `strict_uncertainty_assumptions.csv`
+- `visualization_PCA_species_scores.csv`
+- `visualization_PCA_loadings.csv`
+- `visualization_PCA_eigenvalues.csv`
+- `projected_primary_root_PCA_point.csv`
+- `projected_primary_root_PCA_ellipses.csv`
+- `strict_ancestral_climatic_core.png`
+- `strict_ancestral_climatic_core.pdf`
+- `strict_ancestral_climate_reconstruction_outputs.xlsx`
