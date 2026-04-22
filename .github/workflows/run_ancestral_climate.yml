@@ -56,10 +56,7 @@ env:
   CLIMATE_FILE: data/raw/climate.csv
   RESULT_DIR: results/result_block_1_strict_ancestral_climate
   FIT_CACHE_DIR: results/result_block_1_strict_ancestral_climate/cache
-  # Include the scientific script and primary inputs in the cache prefix.
-  # If the script, phylogeny, or climate table changes, old model-fit caches
-  # will not be restored for the new production run.
-  FIT_CACHE_PREFIX: ancestral-fit-cache-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}
+  FIT_CACHE_NAMESPACE: ancestral-fit-cache
 
 jobs:
   run-ancestral-climate:
@@ -257,9 +254,11 @@ jobs:
           # This key is deliberately unique for this run. The restore key below
           # pulls the newest cache with the same script/data hash, and the save
           # step writes a fresh immutable cache after a successful run.
-          key: ${{ env.FIT_CACHE_PREFIX }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # runner.os and hashFiles are used here, not in top-level env, because
+          # runner context is available to steps but not to workflow-level env.
+          key: ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ${{ env.FIT_CACHE_PREFIX }}-
+            ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-
 
       - name: Report fit cache restore status
         if: ${{ always() }}
@@ -382,7 +381,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.FIT_CACHE_DIR }}
-          key: ${{ env.FIT_CACHE_PREFIX }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload stage results
         if: ${{ always() && inputs.upload_results }}
