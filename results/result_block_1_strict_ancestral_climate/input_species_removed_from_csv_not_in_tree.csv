@@ -1,0 +1,3 @@
+species_original,species_clean,tree_label,annual_mean_temperature,annual_precipitation,maximum_temperature_warmest_month,mean_temperature_coldest_quarter,mean_temperature_driest_quarter,minimum_temperature_coldest_month,precipitation_in_coldest_quarter,precipitation_of_coldest_quarter,precipitation_of_wettest_quarter,precipitation_wettest_month,temperature_annual_range,temperature_seasonality
+Parvipsitta porphyrocephala,parvipsitta porphyrocephala,parvipsitta_porphyrocephala,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA,NA
+Sphenopsis ochracea,sphenopsis ochracea,sphenopsis_ochracea,162.0938011,1849.911838,201.8789119,159.1918484,160.2674504,120.758059,311.4240126,311.4240126,839.4960659,285.1018121,81.13774323,246.9064225

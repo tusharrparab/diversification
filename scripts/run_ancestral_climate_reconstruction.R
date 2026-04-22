@@ -2,31 +2,37 @@
 # Result Block 1: strict ancestral climatic reconstruction
 # ============================================================
 #
-# README-style method note
-# ------------------------
-# This script asks: "Where did the radiation begin in climatic space?"
+# Scientific question
+# -------------------
+# Where did the radiation begin in climatic space?
 #
-# The inferential rule is deliberately strict:
-#   1. Ancestral climate is reconstructed in the original environmental
-#      variables, never on PCA axes.
-#   2. PCA is computed only from extant, scaled climate variables and is used
-#      only as a visualization space.
-#   3. Each climate variable is first fit with candidate evolutionary models
-#      using geiger::fitContinuous(): BM, OU, EB, lambda, delta, mean_trend.
-#   4. Primary root reconstruction is limited to models with an explicit,
-#      defensible reconstruction path here: BM, lambda, and delta.
-#   5. OU, EB, and mean_trend are fit-and-flag sensitivity models. They can win
-#      AICc, but they are not silently forced into the primary root ellipse.
+# Core rule
+# ---------
+# Ancestral climate is reconstructed in the original climate variables.
+# PCA is only a visualization layer used after reconstruction.
 #
-# Approximate pieces that remain:
-#   - Root uncertainty is propagated to PCA space with a diagonal covariance
-#     matrix across original climate variables. Cross-variable covariance in
-#     ancestral uncertainty is not estimated.
-#   - ape::ace() confidence intervals are converted to an approximate variance
-#     as (CI width / 2 / 1.96)^2 when no direct variance is returned.
-#   - If a variable has no valid primary reconstruction, its extant mean is used
-#     only to place the root point in PCA space; it contributes no uncertainty
-#     to the root ellipse and is explicitly flagged.
+# Model policy
+# ------------
+# Each variable is fit with geiger::fitContinuous() under:
+#   BM, OU, EB, lambda, delta, mean_trend
+#
+# Primary ancestral reconstruction is intentionally restricted to:
+#   BM, lambda, delta
+#
+# OU, EB, and mean_trend are sensitivity-only models. They can be the
+# best-supported AICc model, but they are never silently forced into the primary
+# root estimate or root ellipse.
+#
+# Approximation policy
+# --------------------
+# Every approximation is written into code comments and output summaries:
+#   - PCA is not inferential.
+#   - The projected ellipse is not a fully jointly inferred ancestral niche.
+#   - The ellipse uses a diagonal covariance approximation across original
+#     climate variables, then projects that uncertainty into PCA space.
+#   - ape::ace() CI95 widths are converted to approximate variances when needed.
+#   - If a variable has no valid primary estimate, its extant mean can be used
+#     only to place a root point in PCA space and does not add uncertainty.
 
 req_pkgs <- c(
   "ape", "geiger", "phytools", "dplyr", "readr", "stringr", "ggplot2",
@@ -52,12 +58,79 @@ suppressPackageStartupMessages({
   library(scales)
 })
 
+# -----------------------------
+# Runtime options
+# -----------------------------
+truthy <- function(x) {
+  tolower(as.character(x)) %in% c("1", "true", "yes", "y")
+}
+
+get_cli_value <- function(args, key, default = NA_character_) {
+  key_eq <- paste0("--", key, "=")
+  hit_eq <- args[startsWith(args, key_eq)]
+  if (length(hit_eq) > 0) {
+    return(sub(key_eq, "", hit_eq[1], fixed = TRUE))
+  }
+
+  key_plain <- paste0("--", key)
+  hit <- which(args == key_plain)
+  if (length(hit) > 0 && hit[1] < length(args)) {
+    return(args[hit[1] + 1])
+  }
+
+  default
+}
+
+has_cli_flag <- function(args, key) {
+  paste0("--", key) %in% args
+}
+
+args <- commandArgs(trailingOnly = TRUE)
+
 tree_file <- Sys.getenv("TREE_FILE", "data/raw/pruned_phylogeny.nex")
 climate_file <- Sys.getenv("CLIMATE_FILE", "data/raw/climate.csv")
 output_dir <- Sys.getenv("OUTPUT_DIR", "results/result_block_1_strict_ancestral_climate")
+pipeline_stage <- get_cli_value(args, "stage", Sys.getenv("PIPELINE_STAGE", "all"))
+pipeline_stage <- match.arg(
+  pipeline_stage,
+  choices = c("all", "model_fit", "root_reconstruction", "pca_projection", "plot")
+)
+
+geiger_ncores <- suppressWarnings(as.integer(Sys.getenv("GEIGER_NCORES", "1")))
+if (is.na(geiger_ncores) || geiger_ncores < 1) geiger_ncores <- 1
+
+skip_plots <- truthy(Sys.getenv("SKIP_PLOTS", "false")) || has_cli_flag(args, "skip-plots")
+force_refit_models <- truthy(Sys.getenv("FORCE_REFIT_MODELS", "false")) ||
+  has_cli_flag(args, "force-refit-models")
+resume_model_cache <- truthy(Sys.getenv("RESUME_MODEL_CACHE", "true")) &&
+  !has_cli_flag(args, "no-resume-model-cache")
+save_intermediate_rds <- truthy(Sys.getenv("SAVE_INTERMEDIATE_RDS", "false")) ||
+  has_cli_flag(args, "save-intermediate-rds")
+
+min_valid_values <- suppressWarnings(as.integer(Sys.getenv("MIN_VALID_VALUES", "10")))
+if (is.na(min_valid_values) || min_valid_values < 3) min_valid_values <- 10
+
+primary_delta_warning <- suppressWarnings(as.numeric(Sys.getenv("PRIMARY_DELTA_WARNING", "4")))
+primary_delta_severe <- suppressWarnings(as.numeric(Sys.getenv("PRIMARY_DELTA_SEVERE", "10")))
+sensitivity_winner_prop_warning <- suppressWarnings(as.numeric(Sys.getenv("SENSITIVITY_WINNER_PROP_WARNING", "0.33")))
+ci_nearly_whole_range_ratio <- suppressWarnings(as.numeric(Sys.getenv("CI_NEARLY_WHOLE_RANGE_RATIO", "0.8")))
+ci_extremely_wide_ratio <- suppressWarnings(as.numeric(Sys.getenv("CI_EXTREMELY_WIDE_RATIO", "2")))
+root_abs_z_warning <- suppressWarnings(as.numeric(Sys.getenv("ROOT_ABS_Z_WARNING", "2.5")))
+cov_condition_warning <- suppressWarnings(as.numeric(Sys.getenv("COV_CONDITION_WARNING", "100000000")))
 
 dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+cache_dir <- file.path(output_dir, "cache")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
 
+pipeline_warnings <- character()
+add_pipeline_warning <- function(message_text) {
+  pipeline_warnings <<- c(pipeline_warnings, message_text)
+  warning(message_text, immediate. = TRUE, call. = FALSE)
+}
+
+# -----------------------------
+# General helpers
+# -----------------------------
 clean_text <- function(x) {
   x |>
     as.character() |>
@@ -82,6 +155,19 @@ standardize_colname <- function(x) {
     str_replace_all("^_|_$", "")
 }
 
+safe_file_component <- function(x) {
+  x |>
+    as.character() |>
+    str_replace_all("[^A-Za-z0-9_]+", "_") |>
+    str_replace_all("_+", "_") |>
+    str_replace_all("^_|_$", "")
+}
+
+collapse_flags <- function(x) {
+  x <- x[!is.na(x) & nzchar(x) & x != "none"]
+  if (length(x) == 0) "none" else paste(unique(x), collapse = "; ")
+}
+
 pick_existing_column <- function(df, candidates, required = TRUE) {
   standardized_names <- standardize_colname(names(df))
   standardized_candidates <- standardize_colname(candidates)
@@ -104,8 +190,11 @@ pick_existing_column <- function(df, candidates, required = TRUE) {
 }
 
 read_tree_robust <- function(file) {
-  obj <- tryCatch(read.nexus(file), error = function(e) NULL)
+  if (!file.exists(file)) {
+    stop("Tree file does not exist: ", file)
+  }
 
+  obj <- tryCatch(read.nexus(file), error = function(e) NULL)
   if (is.null(obj)) {
     message("read.nexus() failed. Trying read.tree() instead.")
     obj <- tryCatch(read.tree(file), error = function(e) NULL)
@@ -114,21 +203,39 @@ read_tree_robust <- function(file) {
   if (is.null(obj)) {
     stop("Could not read phylogeny from: ", file)
   }
-
   if (inherits(obj, "multiPhylo")) {
     message("Multiple trees detected. Using the first tree.")
     obj <- obj[[1]]
   }
-
   if (!inherits(obj, "phylo")) {
     stop("Tree file was read, but result is not a valid phylo object.")
   }
-
   if (is.null(obj$tip.label) || length(obj$tip.label) == 0) {
     stop("Tree has no tip labels.")
   }
 
   obj
+}
+
+shoelace_area <- function(x, y) {
+  if (length(x) < 3 || length(y) < 3) return(NA_real_)
+  idx_next <- c(seq_along(x)[-1], 1)
+  abs(sum(x * y[idx_next] - y * x[idx_next])) / 2
+}
+
+point_in_polygon <- function(px, py, poly_x, poly_y) {
+  n <- length(poly_x)
+  if (n < 3) return(FALSE)
+
+  inside <- FALSE
+  j <- n
+  for (i in seq_len(n)) {
+    intersects <- ((poly_y[i] > py) != (poly_y[j] > py)) &&
+      (px < (poly_x[j] - poly_x[i]) * (py - poly_y[i]) / (poly_y[j] - poly_y[i]) + poly_x[i])
+    if (intersects) inside <- !inside
+    j <- i
+  }
+  inside
 }
 
 make_ellipse <- function(center, cov_mat, level = 0.95, n = 300) {
@@ -140,11 +247,27 @@ make_ellipse <- function(center, cov_mat, level = 0.95, n = 300) {
   pts <- sweep(circle %*% t(transform) * radius, 2, center, FUN = "+")
   out <- as.data.frame(pts)
   colnames(out) <- c("x", "y")
-  out$level <- paste0(round(level * 100), "%")
-  out$level_probability <- level
+  out$confidence_level <- level
+  out$confidence_label <- paste0(round(level * 100), "%")
   out
 }
 
+ellipse_area <- function(cov_mat, level) {
+  stats::qchisq(level, df = 2) * pi * sqrt(det(cov_mat))
+}
+
+classify_ratio_size <- function(ratio) {
+  case_when(
+    !is.finite(ratio) ~ "unknown",
+    ratio < 0.05 ~ "small",
+    ratio < 0.25 ~ "moderate",
+    TRUE ~ "large"
+  )
+}
+
+# -----------------------------
+# Climate variable definitions
+# -----------------------------
 climate_vars <- c(
   "annual_mean_temperature",
   "annual_precipitation",
@@ -178,170 +301,13 @@ precip_vars <- c(
   "precipitation_wettest_month"
 )
 
-tree <- read_tree_robust(tree_file)
-write_csv(
-  tibble(tree_tip_label_raw = tree$tip.label),
-  file.path(output_dir, "tree_tip_labels_raw.csv")
-)
-
-clim <- read_csv(climate_file, show_col_types = FALSE)
-
-species_col <- pick_existing_column(clim, c("species"))
-col_map <- list(
-  annual_mean_temperature = c("annual_mean_temperature", "Annual mean temperature_mean"),
-  annual_precipitation = c("annual_precipitation", "Annual precipitation_mean"),
-  maximum_temperature_warmest_month = c(
-    "maximum_temperature_warmest_month",
-    "Max Temperature_warmest month_mean"
-  ),
-  mean_temperature_coldest_quarter = c(
-    "mean_temperature_coldest_quarter",
-    "Mean Temp coldest Quarter_mean"
-  ),
-  mean_temperature_driest_quarter = c(
-    "mean_temperature_driest_quarter",
-    "Mean Temp Driest Quarter_mean"
-  ),
-  minimum_temperature_coldest_month = c(
-    "minimum_temperature_coldest_month",
-    "Min Temp_Coldest Month_mean"
-  ),
-  precipitation_in_coldest_quarter = c(
-    "precipitation_in_coldest_quarter",
-    "Precipitation in Coldest Quarter_mean"
-  ),
-  precipitation_of_coldest_quarter = c(
-    "precipitation_of_coldest_quarter",
-    "Precipitation of coldest Quarter_mean"
-  ),
-  precipitation_of_wettest_quarter = c(
-    "precipitation_of_wettest_quarter",
-    "Precipitation of Wettest Quarter_mean"
-  ),
-  precipitation_wettest_month = c(
-    "precipitation_wetest_month",
-    "precipitation_wettest_month",
-    "Precipitation Wetest Month_mean",
-    "Precipitation Wettest Month_mean"
-  ),
-  temperature_annual_range = c("temperature_annual_range", "Temp Annual Range_mean"),
-  temperature_seasonality = c(
-    "temperature_seasonality",
-    "Temp Seasonality (Standard Deviation)_mean"
-  )
-)
-
-selected_cols <- lapply(col_map, function(candidates) pick_existing_column(clim, candidates))
-
-write_csv(
-  tibble(species_raw = clim[[species_col]]),
-  file.path(output_dir, "climate_species_raw.csv")
-)
-
-clim2 <- clim %>%
-  transmute(
-    species_original = .data[[species_col]],
-    species_clean = clean_text(.data[[species_col]]),
-    tree_label = normalize_species(.data[[species_col]]),
-    annual_mean_temperature = as.numeric(.data[[selected_cols$annual_mean_temperature]]),
-    annual_precipitation = as.numeric(.data[[selected_cols$annual_precipitation]]),
-    maximum_temperature_warmest_month = as.numeric(.data[[selected_cols$maximum_temperature_warmest_month]]),
-    mean_temperature_coldest_quarter = as.numeric(.data[[selected_cols$mean_temperature_coldest_quarter]]),
-    mean_temperature_driest_quarter = as.numeric(.data[[selected_cols$mean_temperature_driest_quarter]]),
-    minimum_temperature_coldest_month = as.numeric(.data[[selected_cols$minimum_temperature_coldest_month]]),
-    precipitation_in_coldest_quarter = as.numeric(.data[[selected_cols$precipitation_in_coldest_quarter]]),
-    precipitation_of_coldest_quarter = as.numeric(.data[[selected_cols$precipitation_of_coldest_quarter]]),
-    precipitation_of_wettest_quarter = as.numeric(.data[[selected_cols$precipitation_of_wettest_quarter]]),
-    precipitation_wettest_month = as.numeric(.data[[selected_cols$precipitation_wettest_month]]),
-    temperature_annual_range = as.numeric(.data[[selected_cols$temperature_annual_range]]),
-    temperature_seasonality = as.numeric(.data[[selected_cols$temperature_seasonality]])
-  )
-
-duplicate_species <- clim2 %>%
-  count(tree_label, sort = TRUE) %>%
-  filter(n > 1)
-
-if (nrow(duplicate_species) > 0) {
-  write_csv(duplicate_species, file.path(output_dir, "duplicate_climate_species.csv"))
-  clim2 <- clim2 %>% distinct(tree_label, .keep_all = TRUE)
-}
-
-tree$tip.label <- normalize_species(tree$tip.label)
-
-tree_tips <- tree$tip.label
-clim_species <- clim2$tree_label
-overlap <- intersect(tree_tips, clim_species)
-
-match_summary <- tibble(
-  tree_tips = length(tree_tips),
-  climate_species = length(clim_species),
-  matched_species_before_missing_filter = length(overlap),
-  tree_is_rooted_before_pruning = is.rooted(tree)
-)
-
-write_csv(match_summary, file.path(output_dir, "match_summary.csv"))
-
-if (length(overlap) == 0) {
-  stop(
-    "Zero overlap between tree tip labels and climate species names after normalization. ",
-    "Inspect tree_tip_labels_raw.csv and climate_species_raw.csv."
-  )
-}
-
-write_csv(
-  clim2 %>% filter(!tree_label %in% tree_tips),
-  file.path(output_dir, "species_removed_from_csv_not_in_tree.csv")
-)
-
-clim_complete <- clim2 %>%
-  filter(tree_label %in% tree_tips) %>%
-  filter(if_all(all_of(climate_vars), ~ !is.na(.)))
-
-matched_species <- intersect(tree$tip.label, clim_complete$tree_label)
-
-if (length(matched_species) < 3) {
-  stop("Fewer than 3 species remain after matching tree and complete climate data.")
-}
-
-tips_to_drop <- setdiff(tree$tip.label, matched_species)
-write_csv(
-  tibble(tree_tip_missing_complete_climate = tips_to_drop),
-  file.path(output_dir, "tree_tips_missing_climate.csv")
-)
-
-tree_pruned <- if (length(tips_to_drop) > 0) drop.tip(tree, tips_to_drop) else tree
-
-if (is.null(tree_pruned) || !inherits(tree_pruned, "phylo")) {
-  stop("Pruned tree is invalid.")
-}
-
-clim_final <- clim_complete %>%
-  filter(tree_label %in% tree_pruned$tip.label) %>%
-  slice(match(tree_pruned$tip.label, tree_label))
-
-if (!all(clim_final$tree_label == tree_pruned$tip.label)) {
-  stop("Ordering mismatch between climate data and tree tips.")
-}
-
-write_csv(clim_final, file.path(output_dir, "matched_climate_data_used.csv"))
-
-X <- clim_final %>%
-  select(all_of(climate_vars)) %>%
-  as.data.frame()
-rownames(X) <- clim_final$tree_label
-
 candidate_models <- c("BM", "OU", "EB", "lambda", "delta", "mean_trend")
 primary_models <- c("BM", "lambda", "delta")
 sensitivity_models <- setdiff(candidate_models, primary_models)
-crown_node <- as.character(Ntip(tree_pruned) + 1)
-geiger_ncores <- suppressWarnings(as.integer(Sys.getenv("GEIGER_NCORES", "1")))
-if (is.na(geiger_ncores) || geiger_ncores < 1) geiger_ncores <- 1
 
-collapse_flags <- function(x) {
-  x <- x[!is.na(x) & nzchar(x)]
-  if (length(x) == 0) "none" else paste(unique(x), collapse = "; ")
-}
-
+# -----------------------------
+# Model fitting helpers
+# -----------------------------
 extract_fit_stat <- function(fit_obj, candidates) {
   for (container in list(fit_obj, fit_obj$opt)) {
     if (is.null(container)) next
@@ -370,7 +336,7 @@ extract_fit_parameter <- function(fit_obj, candidates) {
 }
 
 summarize_fit_parameters <- function(fit_obj) {
-  if (is.null(fit_obj$opt)) return(NA_character_)
+  if (is.null(fit_obj$opt) || !is.list(fit_obj$opt)) return(NA_character_)
   opt <- fit_obj$opt
   drop_names <- c(
     "lnL", "logLik", "loglik", "aic", "AIC", "aicc", "AICc", "k",
@@ -389,7 +355,8 @@ summarize_fit_parameters <- function(fit_obj) {
 
 fit_one_model <- function(tree, trait, variable, model) {
   warnings_seen <- character()
-  result <- tryCatch(
+
+  tryCatch(
     {
       fit <- withCallingHandlers(
         geiger::fitContinuous(
@@ -410,8 +377,13 @@ fit_one_model <- function(tree, trait, variable, model) {
         }
       )
 
+      if (is.null(fit$opt) || !is.list(fit$opt)) {
+        stop("geiger::fitContinuous returned a malformed fit object without a list-valued opt slot")
+      }
+
       aicc <- extract_fit_stat(fit, c("aicc", "AICc"))
       fit_status <- if (is.finite(aicc)) "ok" else "fit_returned_no_finite_AICc"
+
       list(
         row = tibble(
           variable = variable,
@@ -446,7 +418,53 @@ fit_one_model <- function(tree, trait, variable, model) {
       )
     }
   )
-  result
+}
+
+cache_path_for_variable <- function(variable) {
+  file.path(cache_dir, paste0(safe_file_component(variable), "_fitContinuous_cache.rds"))
+}
+
+validate_cached_fit <- function(cache_obj, variable, tree, trait) {
+  is.list(cache_obj) &&
+    identical(cache_obj$variable, variable) &&
+    identical(cache_obj$tip_labels, tree$tip.label) &&
+    identical(cache_obj$trait_names, names(trait)) &&
+    length(cache_obj$model_rows) > 0 &&
+    is.list(cache_obj$fit_objects)
+}
+
+fit_models_for_variable <- function(tree, trait, variable) {
+  cache_path <- cache_path_for_variable(variable)
+
+  if (resume_model_cache && !force_refit_models && file.exists(cache_path)) {
+    cache_obj <- readRDS(cache_path)
+    if (validate_cached_fit(cache_obj, variable, tree, trait)) {
+      message("  using cached fitContinuous fits for ", variable)
+      return(cache_obj)
+    }
+    add_pipeline_warning(paste0("Ignoring stale or malformed model cache for ", variable))
+  }
+
+  message("  fitting all candidate models for ", variable)
+  fit_objects <- list()
+  fit_rows <- list()
+
+  for (m in candidate_models) {
+    message("    ", variable, " under ", m)
+    fit_result <- fit_one_model(tree, trait, variable = variable, model = m)
+    fit_objects[[m]] <- fit_result$fit
+    fit_rows[[length(fit_rows) + 1]] <- fit_result$row
+  }
+
+  out <- list(
+    variable = variable,
+    tip_labels = tree$tip.label,
+    trait_names = names(trait),
+    model_rows = bind_rows(fit_rows),
+    fit_objects = fit_objects
+  )
+  saveRDS(out, cache_path)
+  out
 }
 
 add_model_deltas <- function(model_fit_table) {
@@ -459,6 +477,34 @@ add_model_deltas <- function(model_fit_table) {
     ungroup()
 }
 
+select_best_row <- function(rows) {
+  rows %>%
+    filter(is.finite(AICc)) %>%
+    arrange(AICc, model) %>%
+    slice(1)
+}
+
+summarize_model_selection <- function(model_fit_table) {
+  model_fit_table %>%
+    group_by(variable) %>%
+    group_modify(function(.x, .y) {
+      best_overall <- select_best_row(.x)
+      best_primary <- select_best_row(.x %>% filter(model %in% primary_models))
+
+      tibble(
+        best_overall_model = if (nrow(best_overall) == 1) best_overall$model else NA_character_,
+        best_overall_AICc = if (nrow(best_overall) == 1) best_overall$AICc else NA_real_,
+        primary_model = if (nrow(best_primary) == 1) best_primary$model else NA_character_,
+        primary_AICc = if (nrow(best_primary) == 1) best_primary$AICc else NA_real_,
+        primary_delta_from_best = primary_AICc - best_overall_AICc
+      )
+    }) %>%
+    ungroup()
+}
+
+# -----------------------------
+# Primary and sensitivity root reconstruction
+# -----------------------------
 extract_root_value <- function(ace_like_obj, tree) {
   root_node <- as.character(Ntip(tree) + 1)
   ace_values <- ace_like_obj$ace
@@ -472,7 +518,9 @@ extract_root_value <- function(ace_like_obj, tree) {
 extract_root_ci <- function(ace_obj, tree) {
   root_node <- as.character(Ntip(tree) + 1)
   ci <- ace_obj$CI95
-  if (is.null(ci) || !is.matrix(ci) || ncol(ci) < 2) return(c(NA_real_, NA_real_))
+  if (is.null(ci) || !is.matrix(ci) || ncol(ci) < 2) {
+    return(c(NA_real_, NA_real_))
+  }
   if (!is.null(rownames(ci)) && root_node %in% rownames(ci)) {
     return(as.numeric(ci[root_node, 1:2]))
   }
@@ -489,6 +537,10 @@ variance_from_ci <- function(ci_low, ci_high) {
 transform_tree_for_primary_model <- function(tree, fit_obj, primary_model) {
   if (primary_model == "BM") {
     return(list(tree = tree, transform_parameter = NA_real_, transform_status = "not_applicable"))
+  }
+
+  if (is.null(fit_obj) || is.null(fit_obj$opt)) {
+    stop("Primary model ", primary_model, " has no valid fit object or opt slot")
   }
 
   if (primary_model == "lambda") {
@@ -541,18 +593,18 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
 
       tibble(
         variable = variable,
-        primary_model_used = primary_model,
+        reconstruction_model = primary_model,
         transform_parameter = tree_info$transform_parameter,
         transform_status = tree_info$transform_status,
         root_estimate = extract_root_value(ace_fit, recon_tree),
         root_variance = root_variance,
-        CI_low = ci[1],
-        CI_high = ci[2],
         root_variance_source = if_else(
           is.finite(root_variance),
           "CI95_width_assuming_normality",
           "unavailable"
         ),
+        CI_low = ci[1],
+        CI_high = ci[2],
         reconstruction_status = if_else(
           is.finite(root_variance),
           "ok",
@@ -564,14 +616,14 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
     error = function(e) {
       tibble(
         variable = variable,
-        primary_model_used = primary_model,
+        reconstruction_model = primary_model,
         transform_parameter = NA_real_,
         transform_status = "failed",
         root_estimate = NA_real_,
         root_variance = NA_real_,
+        root_variance_source = "unavailable",
         CI_low = NA_real_,
         CI_high = NA_real_,
-        root_variance_source = "unavailable",
         reconstruction_status = "failed",
         reconstruction_error = conditionMessage(e)
       )
@@ -585,7 +637,7 @@ compute_sensitivity_root <- function(tree, trait, variable, sensitivity_model) {
       variable = variable,
       sensitivity_model = NA_character_,
       sensitivity_root_estimate = NA_real_,
-      sensitivity_status = "not_requested",
+      sensitivity_status = "not_needed_best_overall_is_primary",
       sensitivity_error = NA_character_
     ))
   }
@@ -642,157 +694,947 @@ compute_sensitivity_root <- function(tree, trait, variable, sensitivity_model) {
   )
 }
 
-select_best_row <- function(rows) {
-  rows %>%
-    filter(is.finite(AICc)) %>%
-    arrange(AICc, model) %>%
-    slice(1)
-}
-
-make_positive_definite <- function(cov_mat) {
-  if (any(!is.finite(cov_mat))) {
-    stop("Covariance matrix contains non-finite values")
-  }
-  eig <- eigen(cov_mat, symmetric = TRUE)$values
-  if (any(eig <= sqrt(.Machine$double.eps))) {
-    cov_mat <- as.matrix(Matrix::nearPD(cov_mat, corr = FALSE)$mat)
-  }
-  cov_mat
-}
-
 # -----------------------------
-# Primary inference: model fitting and original-variable root states
+# Biological diagnostics
 # -----------------------------
-message("Fitting per-variable evolutionary models with geiger::fitContinuous().")
-
-fit_objects <- setNames(vector("list", length(climate_vars)), climate_vars)
-fit_rows <- list()
-
-for (v in climate_vars) {
-  trait <- X[[v]]
-  names(trait) <- rownames(X)
-  trait <- trait[tree_pruned$tip.label]
-  fit_objects[[v]] <- list()
-
-  for (m in candidate_models) {
-    message("  fitting ", v, " under ", m)
-    fit_result <- fit_one_model(tree_pruned, trait, variable = v, model = m)
-    fit_rows[[length(fit_rows) + 1]] <- fit_result$row
-    fit_objects[[v]][[m]] <- fit_result$fit
-  }
-}
-
-model_fit_table <- bind_rows(fit_rows) %>%
-  add_model_deltas()
-
-reconstruction_rows <- list()
-
-for (v in climate_vars) {
-  trait <- X[[v]]
-  names(trait) <- rownames(X)
-  trait <- trait[tree_pruned$tip.label]
-
-  rows_v <- model_fit_table %>% filter(variable == v)
-  best_overall <- select_best_row(rows_v)
-  best_primary <- select_best_row(rows_v %>% filter(model %in% primary_models))
-
-  best_overall_model <- if (nrow(best_overall) == 1) best_overall$model else NA_character_
-  best_overall_aicc <- if (nrow(best_overall) == 1) best_overall$AICc else NA_real_
-  best_primary_model <- if (nrow(best_primary) == 1) best_primary$model else NA_character_
-  best_primary_aicc <- if (nrow(best_primary) == 1) best_primary$AICc else NA_real_
-  delta_primary_minus_overall <- best_primary_aicc - best_overall_aicc
-
-  if (is.na(best_primary_model)) {
-    primary_recon <- tibble(
-      variable = v,
-      primary_model_used = NA_character_,
-      transform_parameter = NA_real_,
-      transform_status = "not_available",
-      root_estimate = NA_real_,
-      root_variance = NA_real_,
-      CI_low = NA_real_,
-      CI_high = NA_real_,
-      root_variance_source = "unavailable",
-      reconstruction_status = "failed_no_primary_model_fit",
-      reconstruction_error = "No finite AICc fit among BM, lambda, or delta"
-    )
-  } else {
-    primary_recon <- reconstruct_primary_root(
-      tree = tree_pruned,
-      trait = trait,
-      variable = v,
-      primary_model = best_primary_model,
-      fit_obj = fit_objects[[v]][[best_primary_model]]
-    )
-  }
-
-  sensitivity_recon <- if (best_overall_model %in% sensitivity_models) {
-    compute_sensitivity_root(tree_pruned, trait, variable = v, sensitivity_model = best_overall_model)
-  } else {
+calculate_extant_stats <- function(X) {
+  bind_rows(lapply(names(X), function(v) {
+    x <- X[[v]]
     tibble(
       variable = v,
-      sensitivity_model = NA_character_,
-      sensitivity_root_estimate = NA_real_,
-      sensitivity_status = "not_needed_best_overall_is_primary",
-      sensitivity_error = NA_character_
+      n_valid_values = sum(is.finite(x)),
+      n_unique_values = length(unique(x[is.finite(x)])),
+      extant_mean = mean(x, na.rm = TRUE),
+      extant_sd = sd(x, na.rm = TRUE),
+      extant_min = min(x, na.rm = TRUE),
+      extant_max = max(x, na.rm = TRUE),
+      extant_range = extant_max - extant_min
     )
+  }))
+}
+
+classify_variable_interpretability <- function(
+  root_estimate, root_z, root_within_range, ci_width_ratio,
+  primary_delta_from_best, best_overall_model, reconstruction_status
+) {
+  flags <- c()
+  if (!identical(reconstruction_status, "ok")) flags <- c(flags, "primary_reconstruction_uncertain")
+  if (best_overall_model %in% sensitivity_models) flags <- c(flags, "best_model_sensitivity_only")
+  if (is.finite(primary_delta_from_best) && primary_delta_from_best > primary_delta_warning) {
+    flags <- c(flags, "primary_model_AICc_penalty")
   }
+  if (!isTRUE(root_within_range)) flags <- c(flags, "root_outside_extant_range")
+  if (is.finite(abs(root_z)) && abs(root_z) > root_abs_z_warning) flags <- c(flags, "root_extreme_relative_to_extants")
+  if (is.finite(ci_width_ratio) && ci_width_ratio >= ci_nearly_whole_range_ratio) {
+    flags <- c(flags, "CI_spans_most_extant_range")
+  }
+  collapse_flags(flags)
+}
 
-  caution_flag <- collapse_flags(c(
-    if (best_overall_model %in% sensitivity_models) {
-      paste0("best_overall_model_is_sensitivity_only_", best_overall_model)
-    },
-    if (!is.finite(best_primary_aicc)) "no_supported_primary_model_with_finite_AICc",
-    if (!is.finite(primary_recon$root_estimate)) "primary_root_estimate_unavailable",
-    if (!is.finite(primary_recon$root_variance)) "primary_root_uncertainty_unavailable",
-    if (is.finite(delta_primary_minus_overall) && delta_primary_minus_overall > 2) {
-      "primary_model_substantially_worse_than_overall_AICc"
-    }
-  ))
-
-  reconstruction_rows[[length(reconstruction_rows) + 1]] <- primary_recon %>%
-    left_join(sensitivity_recon, by = "variable") %>%
+calculate_root_diagnostics <- function(root_table) {
+  root_table %>%
     mutate(
-      best_overall_model = best_overall_model,
-      best_overall_AICc = best_overall_aicc,
-      best_primary_model = best_primary_model,
-      best_primary_AICc = best_primary_aicc,
-      delta_AICc_primary_minus_overall = delta_primary_minus_overall,
-      extant_mean = mean(trait, na.rm = TRUE),
-      caution_flag = caution_flag,
-      .after = variable
+      CI_width = CI_high - CI_low,
+      CI_width_to_extant_range = if_else(extant_range > 0, CI_width / extant_range, NA_real_),
+      CI_spans_nearly_whole_extant_range = is.finite(CI_width_to_extant_range) &
+        CI_width_to_extant_range >= ci_nearly_whole_range_ratio,
+      CI_extremely_wide = is.finite(CI_width_to_extant_range) &
+        CI_width_to_extant_range >= ci_extremely_wide_ratio,
+      root_lies_within_extant_observed_range = is.finite(root_estimate) &
+        root_estimate >= extant_min &
+        root_estimate <= extant_max,
+      standardized_root_position_relative_to_extant_mean_SD = if_else(
+        is.finite(extant_sd) & extant_sd > 0,
+        (root_estimate - extant_mean) / extant_sd,
+        NA_real_
+      ),
+      ecologically_plausible_rule = case_when(
+        !is.finite(root_estimate) ~ "unknown_no_root_estimate",
+        root_lies_within_extant_observed_range &
+          abs(standardized_root_position_relative_to_extant_mean_SD) <= root_abs_z_warning ~ "plausible_within_extant_distribution",
+        root_lies_within_extant_observed_range ~ "caution_extreme_within_extant_range",
+        TRUE ~ "caution_outside_extant_observed_range"
+      ),
+      interpretability_flag = mapply(
+        classify_variable_interpretability,
+        root_estimate,
+        standardized_root_position_relative_to_extant_mean_SD,
+        root_lies_within_extant_observed_range,
+        CI_width_to_extant_range,
+        primary_delta_from_best,
+        best_overall_model,
+        reconstruction_status
+      ),
+      variable_interpretation_class = case_when(
+        interpretability_flag == "none" ~ "robust",
+        str_detect(interpretability_flag, "primary_model_AICc_penalty|root_outside|CI_spans|best_model_sensitivity_only") ~ "fragile",
+        TRUE ~ "tentative"
+      ),
+      contributes_to_main_root_estimate = is.finite(root_estimate) & reconstruction_status %in% c("ok", "ok_root_variance_unavailable"),
+      contributes_to_uncertainty_ellipse = is.finite(root_variance) & root_variance > 0
     )
 }
 
-ancestral_reconstruction_summary <- bind_rows(reconstruction_rows) %>%
-  select(
+coherence_level <- function(root_table, variable) {
+  z <- root_table$standardized_root_position_relative_to_extant_mean_SD[root_table$variable == variable]
+  if (length(z) == 0 || !is.finite(z)) return("unknown")
+  if (z >= 1.5) return("high")
+  if (z <= -1.5) return("low")
+  "near_extant_mean"
+}
+
+cross_variable_coherence_diagnostics <- function(root_table) {
+  level <- function(v) coherence_level(root_table, v)
+
+  rows <- list(
+    tibble(
+      rule_id = "thermal_mean_vs_cold_quarter",
+      variables_involved = "annual_mean_temperature; mean_temperature_coldest_quarter; temperature_annual_range",
+      screen_result = if (
+        level("annual_mean_temperature") == "high" &&
+          level("mean_temperature_coldest_quarter") == "low" &&
+          level("temperature_annual_range") != "high"
+      ) {
+        "potentially_contradictory"
+      } else {
+        "no_strong_contradiction_detected"
+      },
+      explanation = "Warm annual mean but cold quarter without high annual range is biologically difficult to interpret."
+    ),
+    tibble(
+      rule_id = "thermal_max_vs_min",
+      variables_involved = "maximum_temperature_warmest_month; minimum_temperature_coldest_month; temperature_annual_range",
+      screen_result = if (
+        level("maximum_temperature_warmest_month") == "high" &&
+          level("minimum_temperature_coldest_month") == "low" &&
+          level("temperature_annual_range") != "high"
+      ) {
+        "potentially_contradictory"
+      } else {
+        "no_strong_contradiction_detected"
+      },
+      explanation = "Hot warmest month and cold coldest month should usually coincide with high annual range."
+    ),
+    tibble(
+      rule_id = "temperature_seasonality_vs_range",
+      variables_involved = "temperature_seasonality; temperature_annual_range",
+      screen_result = if (
+        (level("temperature_seasonality") == "high" && level("temperature_annual_range") == "low") ||
+          (level("temperature_seasonality") == "low" && level("temperature_annual_range") == "high")
+      ) {
+        "potentially_contradictory"
+      } else {
+        "no_strong_contradiction_detected"
+      },
+      explanation = "Temperature seasonality and annual range are expected to broadly agree."
+    ),
+    tibble(
+      rule_id = "annual_precip_vs_wettest_quarter",
+      variables_involved = "annual_precipitation; precipitation_of_wettest_quarter; precipitation_wettest_month",
+      screen_result = if (
+        level("annual_precipitation") == "high" &&
+          level("precipitation_of_wettest_quarter") == "low" &&
+          level("precipitation_wettest_month") == "low"
+      ) {
+        "potentially_contradictory"
+      } else if (
+        level("annual_precipitation") == "low" &&
+          (level("precipitation_of_wettest_quarter") == "high" || level("precipitation_wettest_month") == "high")
+      ) {
+        "seasonal_precipitation_caution"
+      } else {
+        "no_strong_contradiction_detected"
+      },
+      explanation = "Annual precipitation should broadly agree with wettest-period precipitation unless precipitation is highly seasonal."
+    ),
+    tibble(
+      rule_id = "cold_quarter_precip_duplicate_check",
+      variables_involved = "precipitation_in_coldest_quarter; precipitation_of_coldest_quarter",
+      screen_result = if (
+        level("precipitation_in_coldest_quarter") != "unknown" &&
+          level("precipitation_of_coldest_quarter") != "unknown" &&
+          level("precipitation_in_coldest_quarter") != level("precipitation_of_coldest_quarter")
+      ) {
+        "potentially_contradictory"
+      } else {
+        "no_strong_contradiction_detected"
+      },
+      explanation = "These two cold-quarter precipitation variables should not strongly disagree if they represent the same biology."
+    )
+  )
+
+  bind_rows(rows)
+}
+
+# -----------------------------
+# Visualization-only PCA and projection
+# -----------------------------
+run_visualization_pca <- function(X, thermal_vars, precip_vars) {
+  X_scaled <- scale(X)
+  x_center <- attr(X_scaled, "scaled:center")
+  x_scale <- attr(X_scaled, "scaled:scale")
+
+  pca_vis <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
+
+  scores <- as.data.frame(pca_vis$x)
+  colnames(scores) <- paste0("PC", seq_len(ncol(scores)))
+  scores$tree_label <- rownames(X)
+
+  loadings <- as.data.frame(pca_vis$rotation)
+  colnames(loadings) <- paste0("PC", seq_len(ncol(loadings)))
+  loadings$variable <- rownames(loadings)
+
+  eigvals <- pca_vis$sdev^2
+  eigenvalues <- tibble(
+    PC = paste0("PC", seq_along(eigvals)),
+    eigenvalue = eigvals,
+    variance_explained = eigvals / sum(eigvals),
+    cumulative_variance = cumsum(eigvals / sum(eigvals))
+  )
+
+  candidate_pcs <- seq_len(min(4, length(eigvals)))
+  thermal_strength <- sapply(candidate_pcs, function(i) {
+    sum(abs(loadings[loadings$variable %in% thermal_vars, paste0("PC", i)]), na.rm = TRUE)
+  })
+  precip_strength <- sapply(candidate_pcs, function(i) {
+    sum(abs(loadings[loadings$variable %in% precip_vars, paste0("PC", i)]), na.rm = TRUE)
+  })
+
+  pc1_idx <- candidate_pcs[which.max(thermal_strength)]
+  remaining <- setdiff(candidate_pcs, pc1_idx)
+  if (length(remaining) == 0) {
+    stop("Could not choose a second PCA visualization axis.")
+  }
+  pc2_idx <- remaining[which.max(precip_strength[match(remaining, candidate_pcs)])]
+
+  pc1_sign <- sign(sum(loadings[loadings$variable %in% thermal_vars, paste0("PC", pc1_idx)], na.rm = TRUE))
+  if (is.na(pc1_sign) || pc1_sign == 0) pc1_sign <- 1
+  pc2_sign <- sign(sum(loadings[loadings$variable %in% precip_vars, paste0("PC", pc2_idx)], na.rm = TRUE))
+  if (is.na(pc2_sign) || pc2_sign == 0) pc2_sign <- 1
+
+  scores$display_PCx_oriented <- scores[[paste0("PC", pc1_idx)]] * pc1_sign
+  scores$display_PCy_oriented <- scores[[paste0("PC", pc2_idx)]] * pc2_sign
+  loadings$display_PCx_oriented <- loadings[[paste0("PC", pc1_idx)]] * pc1_sign
+  loadings$display_PCy_oriented <- loadings[[paste0("PC", pc2_idx)]] * pc2_sign
+
+  list(
+    pca = pca_vis,
+    x_center = x_center,
+    x_scale = x_scale,
+    scores = scores,
+    loadings = loadings,
+    eigenvalues = eigenvalues,
+    display_pc_x = pc1_idx,
+    display_pc_y = pc2_idx,
+    display_sign_x = pc1_sign,
+    display_sign_y = pc2_sign
+  )
+}
+
+make_positive_definite <- function(cov_mat, label) {
+  if (any(!is.finite(cov_mat))) {
+    stop(label, " covariance matrix contains non-finite values.")
+  }
+
+  eig <- eigen(cov_mat, symmetric = TRUE)$values
+  condition_number <- max(abs(eig)) / min(abs(eig))
+  used_near_pd <- FALSE
+
+  if (any(eig <= sqrt(.Machine$double.eps)) || !is.finite(condition_number)) {
+    add_pipeline_warning(paste0(label, " covariance was near-singular; applying Matrix::nearPD()."))
+    cov_mat <- as.matrix(Matrix::nearPD(cov_mat, corr = FALSE)$mat)
+    used_near_pd <- TRUE
+    eig <- eigen(cov_mat, symmetric = TRUE)$values
+    condition_number <- max(abs(eig)) / min(abs(eig))
+  }
+
+  if (any(eig <= sqrt(.Machine$double.eps)) || det(cov_mat) <= sqrt(.Machine$double.eps)) {
+    stop(label, " covariance remained numerically degenerate after nearPD; refusing to draw root ellipse.")
+  }
+
+  if (is.finite(condition_number) && condition_number > cov_condition_warning) {
+    add_pipeline_warning(paste0(label, " covariance has high condition number: ", signif(condition_number, 4)))
+  }
+
+  list(
+    cov = cov_mat,
+    eigenvalues = eig,
+    condition_number = condition_number,
+    used_near_pd = used_near_pd
+  )
+}
+
+project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
+  root_projection_vector <- root_projection_table$projection_value
+  names(root_projection_vector) <- root_projection_table$variable
+
+  root_scaled <- (root_projection_vector[names(pca_obj$x_center)] - pca_obj$x_center) / pca_obj$x_scale
+  root_scores_all <- as.numeric(root_scaled %*% pca_obj$pca$rotation)
+  names(root_scores_all) <- colnames(pca_obj$pca$x)
+
+  root_display_x <- unname(root_scores_all[paste0("PC", pca_obj$display_pc_x)]) * pca_obj$display_sign_x
+  root_display_y <- unname(root_scores_all[paste0("PC", pca_obj$display_pc_y)]) * pca_obj$display_sign_y
+
+  hull_idx <- chull(scores_out$display_PCx_oriented, scores_out$display_PCy_oriented)
+  hull_x <- scores_out$display_PCx_oriented[hull_idx]
+  hull_y <- scores_out$display_PCy_oriented[hull_idx]
+  extant_hull_area <- shoelace_area(hull_x, hull_y)
+  if (!is.finite(extant_hull_area) || extant_hull_area <= sqrt(.Machine$double.eps)) {
+    stop("Displayed extant PCA convex hull has zero or near-zero area; root cloud diagnostics are not interpretable.")
+  }
+  root_inside_hull <- point_in_polygon(root_display_x, root_display_y, hull_x, hull_y)
+
+  cloud_cov <- cov(scores_out[, c("display_PCx_oriented", "display_PCy_oriented")])
+  cloud_cov_info <- make_positive_definite(cloud_cov, "Extant PCA cloud")
+  centroid <- colMeans(scores_out[, c("display_PCx_oriented", "display_PCy_oriented")])
+  root_md2 <- as.numeric(mahalanobis(
+    cbind(root_display_x, root_display_y),
+    center = centroid,
+    cov = cloud_cov_info$cov
+  ))
+  root_centroid_distance <- sqrt(sum((c(root_display_x, root_display_y) - centroid)^2))
+
+  cloud_status <- case_when(
+    !root_inside_hull ~ "outside_extant_climatic_cloud",
+    root_md2 <= qchisq(0.50, df = 2) ~ "central",
+    root_md2 <= qchisq(0.95, df = 2) ~ "marginal",
+    TRUE ~ "outside_extant_climatic_cloud"
+  )
+
+  if (!root_inside_hull || root_md2 > qchisq(0.99, df = 2)) {
+    add_pipeline_warning("Projected root is outside or far beyond the displayed extant PCA cloud.")
+  }
+
+  all_pc_cols <- as.list(root_scores_all)
+  names(all_pc_cols) <- paste0("root_", names(root_scores_all))
+
+  root_point <- as_tibble(all_pc_cols) %>%
+    mutate(
+      selected_display_PCx = paste0("PC", pca_obj$display_pc_x),
+      selected_display_PCy = paste0("PC", pca_obj$display_pc_y),
+      display_PCx_sign = pca_obj$display_sign_x,
+      display_PCy_sign = pca_obj$display_sign_y,
+      display_PCx_oriented = root_display_x,
+      display_PCy_oriented = root_display_y,
+      root_inside_extant_convex_hull_displayed_2D = root_inside_hull,
+      extant_centroid_distance_displayed_2D = root_centroid_distance,
+      mahalanobis_distance_squared_from_extant_cloud_displayed_2D = root_md2,
+      mahalanobis_distance_from_extant_cloud_displayed_2D = sqrt(root_md2),
+      extant_cloud_membership_status = cloud_status,
+      extant_convex_hull_area_displayed_2D = extant_hull_area
+    )
+
+  list(
+    root_point = root_point,
+    root_center = c(display_PCx_oriented = root_display_x, display_PCy_oriented = root_display_y),
+    extant_hull_area = extant_hull_area,
+    root_inside_hull = root_inside_hull,
+    root_md2 = root_md2,
+    root_cloud_status = cloud_status,
+    hull = tibble(x = hull_x, y = hull_y)
+  )
+}
+
+# This function intentionally uses a diagonal covariance matrix in the original
+# climate variables. That means the ellipse is an uncertainty projection of
+# per-variable ancestral estimates, not a full multivariate ancestral niche.
+project_root_uncertainty_to_pca <- function(root_projection_table, pca_obj, root_center, extant_hull_area) {
+  root_var_vec <- root_projection_table$variance_used_for_uncertainty
+  names(root_var_vec) <- root_projection_table$variable
+
+  if (sum(is.finite(root_var_vec) & root_var_vec > 0) < 2) {
+    stop("Fewer than two variables have usable root uncertainty; projected ellipse would be degenerate.")
+  }
+
+  Sigma_root_original <- diag(root_var_vec[names(pca_obj$x_center)])
+  rownames(Sigma_root_original) <- names(pca_obj$x_center)
+  colnames(Sigma_root_original) <- names(pca_obj$x_center)
+
+  S_inv <- diag(1 / pca_obj$x_scale)
+  Sigma_root_scaled <- S_inv %*% Sigma_root_original %*% S_inv
+  Sigma_root_pca <- t(pca_obj$pca$rotation) %*% Sigma_root_scaled %*% pca_obj$pca$rotation
+
+  sign_mat <- diag(c(pca_obj$display_sign_x, pca_obj$display_sign_y))
+  Sigma2 <- Sigma_root_pca[
+    c(pca_obj$display_pc_x, pca_obj$display_pc_y),
+    c(pca_obj$display_pc_x, pca_obj$display_pc_y),
+    drop = FALSE
+  ]
+  Sigma2 <- sign_mat %*% Sigma2 %*% sign_mat
+  cov_info <- make_positive_definite(Sigma2, "Projected root uncertainty")
+  Sigma2 <- cov_info$cov
+
+  levels <- c(0.50, 0.80, 0.95)
+  ell <- bind_rows(lapply(levels, function(level) {
+    area <- ellipse_area(Sigma2, level)
+    ratio <- area / extant_hull_area
+    make_ellipse(root_center, Sigma2, level = level) %>%
+      mutate(
+        ellipse_area = area,
+        extant_convex_hull_area = extant_hull_area,
+        ellipse_area_to_extant_hull_area_ratio = ratio,
+        ellipse_area_relative_to_extant_space = classify_ratio_size(ratio),
+        covariance_condition_number = cov_info$condition_number,
+        covariance_used_nearPD = cov_info$used_near_pd
+      )
+  }))
+
+  if (any(ell$ellipse_area_to_extant_hull_area_ratio[ell$confidence_level == 0.95] > 1, na.rm = TRUE)) {
+    add_pipeline_warning("The 95% projected root ellipse is larger than the extant convex hull in displayed PCA space.")
+  }
+
+  list(ellipse = ell, cov = Sigma2, cov_info = cov_info)
+}
+
+# -----------------------------
+# Output and interpretation helpers
+# -----------------------------
+build_sensitivity_comparison <- function(root_table) {
+  root_table %>%
+    filter(best_overall_model %in% sensitivity_models) %>%
+    transmute(
+      variable,
+      best_overall_model,
+      primary_model,
+      primary_root_estimate = root_estimate,
+      sensitivity_root_estimate,
+      absolute_difference = abs(primary_root_estimate - sensitivity_root_estimate),
+      standardized_difference = if_else(
+        is.finite(extant_sd) & extant_sd > 0,
+        absolute_difference / extant_sd,
+        NA_real_
+      ),
+      sensitivity_flag = case_when(
+        is.na(sensitivity_model) ~ "no_sensitivity_estimate_needed",
+        sensitivity_model == "OU" ~ "OU_best_AICc_flag_only_no_forced_root",
+        !is.finite(sensitivity_root_estimate) ~ "sensitivity_estimate_unavailable",
+        standardized_difference > 1 ~ "large_sensitivity_difference",
+        standardized_difference > 0.5 ~ "moderate_sensitivity_difference",
+        TRUE ~ "low_sensitivity_difference"
+      )
+    )
+}
+
+classify_final_result <- function(metrics) {
+  if (
+    metrics$number_of_usable_primary_variables >= 0.8 * length(climate_vars) &&
+      metrics$proportion_of_variables_with_caution_flags <= 0.25 &&
+      metrics$median_primary_delta_from_best <= 2 &&
+      metrics$number_of_variables_where_root_outside_extant_range <= 1 &&
+      metrics$extant_cloud_membership %in% c("central", "marginal") &&
+      metrics$ellipse_95_area_to_extant_hull_area_ratio <= 0.5
+  ) {
+    return("ROBUST")
+  }
+
+  if (
+    metrics$number_of_usable_primary_variables >= 0.6 * length(climate_vars) &&
+      metrics$proportion_of_variables_with_caution_flags <= 0.5 &&
+      metrics$extant_cloud_membership != "outside_extant_climatic_cloud" &&
+      metrics$ellipse_95_area_to_extant_hull_area_ratio <= 1
+  ) {
+    return("TENTATIVE")
+  }
+
+  "WEAK"
+}
+
+write_interpretation_summary <- function(
+  path, metrics, root_table, coherence_table, sensitivity_table,
+  pipeline_warnings
+) {
+  robust_vars <- root_table$variable[root_table$variable_interpretation_class == "robust"]
+  fragile_vars <- root_table$variable[root_table$variable_interpretation_class == "fragile"]
+  tentative_vars <- root_table$variable[root_table$variable_interpretation_class == "tentative"]
+  contradictions <- coherence_table %>% filter(screen_result %in% c("potentially_contradictory", "seasonal_precipitation_caution"))
+
+  lines <- c(
+    "Result Block 1 biological interpretation summary",
+    "=================================================",
+    "",
+    "Question: Where did the radiation begin in climatic space?",
+    "",
+    "Core method statement:",
+    "Ancestral climate was reconstructed in the original environmental variables after per-variable evolutionary model fitting.",
+    "PCA was used only to visualize extant climatic structure and the projected ancestral root.",
+    "Variables whose best-supported model fell outside the primary reconstructable model set were retained as sensitivity cases and explicitly flagged.",
+    "",
+    paste0("Final classification: ", metrics$final_classification),
+    paste0("Usable primary variables: ", metrics$number_of_usable_primary_variables, " of ", length(climate_vars)),
+    paste0("Variables with OU/EB/mean_trend as best overall model: ", metrics$number_of_variables_with_non_primary_best_model),
+    paste0("Variables with caution flags: ", metrics$number_of_variables_with_caution_flags),
+    paste0("Median primary delta AICc from best model: ", signif(metrics$median_primary_delta_from_best, 4)),
+    paste0("Variables where root is outside extant range: ", metrics$number_of_variables_where_root_outside_extant_range),
+    paste0("Projected root cloud status: ", metrics$extant_cloud_membership),
+    paste0("Projected root Mahalanobis distance squared: ", signif(metrics$root_mahalanobis_distance_squared_in_PCA_space, 4)),
+    paste0("95% ellipse / extant convex hull area ratio: ", signif(metrics$ellipse_95_area_to_extant_hull_area_ratio, 4)),
+    "",
+    "Robust variables:",
+    if (length(robust_vars) == 0) "none" else paste(robust_vars, collapse = ", "),
+    "",
+    "Tentative variables:",
+    if (length(tentative_vars) == 0) "none" else paste(tentative_vars, collapse = ", "),
+    "",
+    "Fragile variables:",
+    if (length(fragile_vars) == 0) "none" else paste(fragile_vars, collapse = ", "),
+    "",
+    "Cross-variable coherence screen:",
+    if (nrow(contradictions) == 0) {
+      "No strong rule-based contradictions detected."
+    } else {
+      paste(paste0(contradictions$rule_id, ": ", contradictions$screen_result), collapse = "\n")
+    },
+    "",
+    "Sensitivity cases:",
+    if (nrow(sensitivity_table) == 0) {
+      "No sensitivity-only model won AICc."
+    } else {
+      paste(paste0(
+        sensitivity_table$variable,
+        " best=", sensitivity_table$best_overall_model,
+        " flag=", sensitivity_table$sensitivity_flag
+      ), collapse = "\n")
+    },
+    "",
+    "Warnings raised during run:",
+    if (length(pipeline_warnings) == 0) "none" else paste(unique(pipeline_warnings), collapse = "\n"),
+    "",
+    "Important limitation:",
+    "The projected root ellipse is an uncertainty projection from per-variable estimates using a diagonal covariance approximation.",
+    "It should not be described as a fully jointly inferred multivariate ancestral climatic niche."
+  )
+
+  writeLines(lines, path)
+}
+
+make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_membership, eigenvalues, pca_obj) {
+  arrow_mult <- 2.5
+  thermal_arrows_df <- loadings %>%
+    filter(variable %in% thermal_vars) %>%
+    transmute(variable, x = display_PCx_oriented * arrow_mult, y = display_PCy_oriented * arrow_mult)
+
+  precip_arrows_df <- loadings %>%
+    filter(variable %in% precip_vars) %>%
+    transmute(variable, x = display_PCx_oriented * arrow_mult, y = display_PCy_oriented * arrow_mult)
+
+  label_df <- bind_rows(
+    core_membership %>% filter(inside_50_projected_root_ellipse) %>% slice_head(n = 15),
+    core_membership %>% slice_head(n = 10)
+  ) %>%
+    distinct(tree_label, .keep_all = TRUE)
+
+  var_pc1 <- percent(eigenvalues$variance_explained[pca_obj$display_pc_x], accuracy = 0.1)
+  var_pc2 <- percent(eigenvalues$variance_explained[pca_obj$display_pc_y], accuracy = 0.1)
+  xlab_txt <- paste0("Thermal climatic gradient (PC", pca_obj$display_pc_x, ", ", var_pc1, ")")
+  ylab_txt <- paste0("Precipitation climatic gradient (PC", pca_obj$display_pc_y, ", ", var_pc2, ")")
+
+  p <- ggplot(scores_out, aes(x = display_PCx_oriented, y = display_PCy_oriented)) +
+    geom_polygon(
+      data = ellipse_df,
+      aes(x = x, y = y, group = confidence_label, fill = confidence_label),
+      alpha = 0.16,
+      color = "black",
+      linewidth = 0.3,
+      inherit.aes = FALSE
+    ) +
+    geom_point(alpha = 0.28, size = 1.35, color = "grey35") +
+    geom_point(
+      data = core_membership %>% filter(inside_50_projected_root_ellipse),
+      aes(x = display_PCx_oriented, y = display_PCy_oriented),
+      inherit.aes = FALSE,
+      size = 1.9,
+      color = "darkgreen",
+      alpha = 0.8
+    ) +
+    geom_point(
+      data = root_point,
+      aes(x = display_PCx_oriented, y = display_PCy_oriented),
+      inherit.aes = FALSE,
+      size = 3.3,
+      shape = 21,
+      fill = "red",
+      color = "black",
+      stroke = 0.5
+    ) +
+    geom_segment(
+      data = thermal_arrows_df,
+      aes(x = 0, y = 0, xend = x, yend = y),
+      inherit.aes = FALSE,
+      arrow = grid::arrow(length = grid::unit(0.18, "cm")),
+      linewidth = 0.45,
+      color = "firebrick"
+    ) +
+    geom_text(
+      data = thermal_arrows_df,
+      aes(x = x, y = y, label = variable),
+      inherit.aes = FALSE,
+      color = "firebrick",
+      size = 2.8
+    ) +
+    geom_segment(
+      data = precip_arrows_df,
+      aes(x = 0, y = 0, xend = x, yend = y),
+      inherit.aes = FALSE,
+      arrow = grid::arrow(length = grid::unit(0.18, "cm")),
+      linewidth = 0.45,
+      color = "steelblue4"
+    ) +
+    geom_text(
+      data = precip_arrows_df,
+      aes(x = x, y = y, label = variable),
+      inherit.aes = FALSE,
+      color = "steelblue4",
+      size = 2.8
+    ) +
+    ggrepel::geom_text_repel(
+      data = label_df,
+      aes(label = species_clean),
+      size = 2.5,
+      max.overlaps = 100,
+      box.padding = 0.18,
+      point.padding = 0.1,
+      min.segment.length = 0
+    ) +
+    geom_hline(yintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey55") +
+    geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey55") +
+    scale_fill_manual(values = c("50%" = "#1b9e77", "80%" = "#d95f02", "95%" = "#7570b3")) +
+    labs(
+      x = xlab_txt,
+      y = ylab_txt,
+      fill = "Projected root CI",
+      title = "Result Block 1: ancestral climatic origin of the crown radiation",
+      subtitle = "Root reconstructed in original climate variables; PCA used only for visualization"
+    ) +
+    theme_classic(base_size = 12)
+
+  ggsave(
+    filename = file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.png"),
+    plot = p,
+    width = 10,
+    height = 8,
+    dpi = 400
+  )
+  ggsave(
+    filename = file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.pdf"),
+    plot = p,
+    width = 10,
+    height = 8
+  )
+
+  write_csv(thermal_arrows_df, file.path(output_dir, "visualization_thermal_loading_arrows.csv"))
+  write_csv(precip_arrows_df, file.path(output_dir, "visualization_precipitation_loading_arrows.csv"))
+  write_csv(label_df, file.path(output_dir, "visualization_species_labels_used_in_plot.csv"))
+}
+
+# -----------------------------
+# Data reading, cleaning, matching
+# -----------------------------
+if (!file.exists(climate_file)) {
+  stop("Climate file does not exist: ", climate_file)
+}
+
+tree <- read_tree_robust(tree_file)
+write_csv(
+  tibble(tree_tip_label_raw = tree$tip.label),
+  file.path(output_dir, "input_tree_tip_labels_raw.csv")
+)
+
+clim <- read_csv(climate_file, show_col_types = FALSE)
+
+species_col <- pick_existing_column(clim, c("species"))
+col_map <- list(
+  annual_mean_temperature = c("annual_mean_temperature", "Annual mean temperature_mean"),
+  annual_precipitation = c("annual_precipitation", "Annual precipitation_mean"),
+  maximum_temperature_warmest_month = c(
+    "maximum_temperature_warmest_month",
+    "Max Temperature_warmest month_mean"
+  ),
+  mean_temperature_coldest_quarter = c(
+    "mean_temperature_coldest_quarter",
+    "Mean Temp coldest Quarter_mean"
+  ),
+  mean_temperature_driest_quarter = c(
+    "mean_temperature_driest_quarter",
+    "Mean Temp Driest Quarter_mean"
+  ),
+  minimum_temperature_coldest_month = c(
+    "minimum_temperature_coldest_month",
+    "Min Temp_Coldest Month_mean"
+  ),
+  precipitation_in_coldest_quarter = c(
+    "precipitation_in_coldest_quarter",
+    "Precipitation in Coldest Quarter_mean"
+  ),
+  precipitation_of_coldest_quarter = c(
+    "precipitation_of_coldest_quarter",
+    "Precipitation of coldest Quarter_mean"
+  ),
+  precipitation_of_wettest_quarter = c(
+    "precipitation_of_wettest_quarter",
+    "Precipitation of Wettest Quarter_mean"
+  ),
+  precipitation_wettest_month = c(
+    "precipitation_wetest_month",
+    "precipitation_wettest_month",
+    "Precipitation Wetest Month_mean",
+    "Precipitation Wettest Month_mean"
+  ),
+  temperature_annual_range = c("temperature_annual_range", "Temp Annual Range_mean"),
+  temperature_seasonality = c(
+    "temperature_seasonality",
+    "Temp Seasonality (Standard Deviation)_mean"
+  )
+)
+
+selected_cols <- lapply(col_map, function(candidates) pick_existing_column(clim, candidates))
+
+write_csv(
+  tibble(species_raw = clim[[species_col]]),
+  file.path(output_dir, "input_climate_species_raw.csv")
+)
+
+clim2 <- clim %>%
+  transmute(
+    species_original = .data[[species_col]],
+    species_clean = clean_text(.data[[species_col]]),
+    tree_label = normalize_species(.data[[species_col]]),
+    annual_mean_temperature = as.numeric(.data[[selected_cols$annual_mean_temperature]]),
+    annual_precipitation = as.numeric(.data[[selected_cols$annual_precipitation]]),
+    maximum_temperature_warmest_month = as.numeric(.data[[selected_cols$maximum_temperature_warmest_month]]),
+    mean_temperature_coldest_quarter = as.numeric(.data[[selected_cols$mean_temperature_coldest_quarter]]),
+    mean_temperature_driest_quarter = as.numeric(.data[[selected_cols$mean_temperature_driest_quarter]]),
+    minimum_temperature_coldest_month = as.numeric(.data[[selected_cols$minimum_temperature_coldest_month]]),
+    precipitation_in_coldest_quarter = as.numeric(.data[[selected_cols$precipitation_in_coldest_quarter]]),
+    precipitation_of_coldest_quarter = as.numeric(.data[[selected_cols$precipitation_of_coldest_quarter]]),
+    precipitation_of_wettest_quarter = as.numeric(.data[[selected_cols$precipitation_of_wettest_quarter]]),
+    precipitation_wettest_month = as.numeric(.data[[selected_cols$precipitation_wettest_month]]),
+    temperature_annual_range = as.numeric(.data[[selected_cols$temperature_annual_range]]),
+    temperature_seasonality = as.numeric(.data[[selected_cols$temperature_seasonality]])
+  )
+
+duplicate_species <- clim2 %>%
+  count(tree_label, sort = TRUE) %>%
+  filter(n > 1)
+
+if (nrow(duplicate_species) > 0) {
+  write_csv(duplicate_species, file.path(output_dir, "input_duplicate_climate_species_after_normalization.csv"))
+  clim2 <- clim2 %>% distinct(tree_label, .keep_all = TRUE)
+}
+
+tree$tip.label <- normalize_species(tree$tip.label)
+
+tree_tips <- tree$tip.label
+clim_species <- clim2$tree_label
+overlap <- intersect(tree_tips, clim_species)
+
+match_summary <- tibble(
+  tree_tips = length(tree_tips),
+  climate_species = length(clim_species),
+  matched_species_before_missing_filter = length(overlap),
+  tree_is_rooted_before_pruning = is.rooted(tree)
+)
+write_csv(match_summary, file.path(output_dir, "input_name_match_summary.csv"))
+
+if (length(overlap) == 0) {
+  stop(
+    "Zero overlap between tree tip labels and climate species names after normalization. ",
+    "Inspect input_tree_tip_labels_raw.csv and input_climate_species_raw.csv."
+  )
+}
+
+write_csv(
+  clim2 %>% filter(!tree_label %in% tree_tips),
+  file.path(output_dir, "input_species_removed_from_csv_not_in_tree.csv")
+)
+
+clim_complete <- clim2 %>%
+  filter(tree_label %in% tree_tips) %>%
+  filter(if_all(all_of(climate_vars), ~ !is.na(.)))
+
+matched_species <- intersect(tree$tip.label, clim_complete$tree_label)
+if (length(matched_species) < min_valid_values) {
+  stop("Too few species remain after matching tree and complete climate data: ", length(matched_species))
+}
+
+tips_to_drop <- setdiff(tree$tip.label, matched_species)
+write_csv(
+  tibble(tree_tip_missing_complete_climate = tips_to_drop),
+  file.path(output_dir, "input_tree_tips_missing_complete_climate.csv")
+)
+
+tree_pruned <- if (length(tips_to_drop) > 0) drop.tip(tree, tips_to_drop) else tree
+if (is.null(tree_pruned) || !inherits(tree_pruned, "phylo")) {
+  stop("Pruned tree is invalid.")
+}
+
+clim_final <- clim_complete %>%
+  filter(tree_label %in% tree_pruned$tip.label) %>%
+  slice(match(tree_pruned$tip.label, tree_label))
+
+if (nrow(clim_final) != length(tree_pruned$tip.label) ||
+    !all(clim_final$tree_label == tree_pruned$tip.label)) {
+  stop("Ordering mismatch between climate data and tree tips after pruning.")
+}
+
+write_csv(clim_final, file.path(output_dir, "input_matched_climate_data_used.csv"))
+
+X <- clim_final %>%
+  select(all_of(climate_vars)) %>%
+  as.data.frame()
+rownames(X) <- clim_final$tree_label
+
+extant_stats <- calculate_extant_stats(X)
+bad_variables <- extant_stats %>%
+  filter(n_valid_values < min_valid_values | n_unique_values < 4)
+if (nrow(bad_variables) > 0) {
+  stop(
+    "Variables have too few valid or unique values for model fitting: ",
+    paste(bad_variables$variable, collapse = ", ")
+  )
+}
+
+crown_node <- as.character(Ntip(tree_pruned) + 1)
+
+# -----------------------------
+# Stage: model fitting
+# -----------------------------
+message("Fitting or loading per-variable geiger::fitContinuous model fits.")
+
+fit_cache_objects <- list()
+for (v in climate_vars) {
+  trait <- X[[v]]
+  names(trait) <- rownames(X)
+  trait <- trait[tree_pruned$tip.label]
+  fit_cache_objects[[v]] <- fit_models_for_variable(tree_pruned, trait, v)
+}
+
+model_fit_attempts <- bind_rows(lapply(fit_cache_objects, `[[`, "model_rows")) %>%
+  add_model_deltas()
+write_csv(model_fit_attempts, file.path(output_dir, "per_variable_model_fit_attempts_detailed.csv"))
+
+if (any(!is.finite(model_fit_attempts$AICc))) {
+  failed_fit_count <- sum(!is.finite(model_fit_attempts$AICc))
+  add_pipeline_warning(paste0(failed_fit_count, " model fits did not return finite AICc; see per_variable_model_fit_attempts_detailed.csv."))
+}
+
+model_selection <- summarize_model_selection(model_fit_attempts)
+if (any(is.na(model_selection$best_overall_model))) {
+  stop(
+    "At least one variable has no finite AICc model fit: ",
+    paste(model_selection$variable[is.na(model_selection$best_overall_model)], collapse = ", ")
+  )
+}
+if (any(is.na(model_selection$primary_model))) {
+  stop(
+    "At least one variable has no finite primary model fit among BM/lambda/delta: ",
+    paste(model_selection$variable[is.na(model_selection$primary_model)], collapse = ", ")
+  )
+}
+
+if (pipeline_stage == "model_fit") {
+  write_csv(model_selection, file.path(output_dir, "per_variable_model_selection_preliminary.csv"))
+  if (save_intermediate_rds) {
+    saveRDS(fit_cache_objects, file.path(cache_dir, "all_fitContinuous_cache_objects.rds"))
+  }
+  message("Stage model_fit complete. Stopping before root reconstruction.")
+  quit(save = "no", status = 0)
+}
+
+# -----------------------------
+# Stage: primary root reconstruction and sensitivity
+# -----------------------------
+message("Reconstructing primary root states in original climate variables.")
+
+root_rows <- list()
+for (v in climate_vars) {
+  trait <- X[[v]]
+  names(trait) <- rownames(X)
+  trait <- trait[tree_pruned$tip.label]
+
+  selected <- model_selection %>% filter(variable == v)
+  root_rows[[length(root_rows) + 1]] <- reconstruct_primary_root(
+    tree = tree_pruned,
+    trait = trait,
+    variable = v,
+    primary_model = selected$primary_model,
+    fit_obj = fit_cache_objects[[v]]$fit_objects[[selected$primary_model]]
+  )
+}
+
+primary_root <- bind_rows(root_rows)
+
+sensitivity_rows <- list()
+for (v in climate_vars) {
+  trait <- X[[v]]
+  names(trait) <- rownames(X)
+  trait <- trait[tree_pruned$tip.label]
+  selected <- model_selection %>% filter(variable == v)
+  sensitivity_rows[[length(sensitivity_rows) + 1]] <- compute_sensitivity_root(
+    tree_pruned,
+    trait,
+    variable = v,
+    sensitivity_model = selected$best_overall_model
+  )
+}
+sensitivity_root <- bind_rows(sensitivity_rows)
+
+ancestral_root_original <- model_selection %>%
+  left_join(primary_root, by = "variable") %>%
+  left_join(sensitivity_root, by = "variable") %>%
+  left_join(extant_stats, by = "variable") %>%
+  calculate_root_diagnostics()
+
+per_variable_model_fits <- ancestral_root_original %>%
+  transmute(
     variable,
     best_overall_model,
     best_overall_AICc,
-    best_primary_model,
-    best_primary_AICc,
-    delta_AICc_primary_minus_overall,
-    primary_model_used,
-    transform_parameter,
-    transform_status,
-    root_estimate,
-    root_variance,
-    root_variance_source,
-    CI_low,
-    CI_high,
-    reconstruction_status,
-    reconstruction_error,
-    caution_flag,
-    sensitivity_model,
-    sensitivity_root_estimate,
-    sensitivity_status,
-    sensitivity_error,
-    extant_mean
+    primary_model,
+    primary_AICc,
+    primary_delta_from_best,
+    caution_flag = interpretability_flag,
+    contributes_to_main_root_estimate,
+    contributes_to_uncertainty_ellipse
   )
 
-# For unresolved variables, use extant means only to place a point in PCA
-# space. They are not allowed to add unsupported uncertainty to the ellipse.
-root_projection_table <- ancestral_reconstruction_summary %>%
+write_csv(per_variable_model_fits, file.path(output_dir, "per_variable_model_fits.csv"))
+write_csv(ancestral_root_original, file.path(output_dir, "ancestral_root_original_climate_strict.csv"))
+
+sensitivity_comparison <- build_sensitivity_comparison(ancestral_root_original)
+write_csv(sensitivity_comparison, file.path(output_dir, "sensitivity_comparison_summary.csv"))
+
+coherence_diagnostics <- cross_variable_coherence_diagnostics(ancestral_root_original)
+write_csv(coherence_diagnostics, file.path(output_dir, "cross_variable_climate_coherence_diagnostics.csv"))
+
+non_primary_best_prop <- mean(ancestral_root_original$best_overall_model %in% sensitivity_models, na.rm = TRUE)
+if (non_primary_best_prop > sensitivity_winner_prop_warning) {
+  add_pipeline_warning(paste0(
+    "High proportion of variables have sensitivity-only best models: ",
+    signif(non_primary_best_prop, 3)
+  ))
+}
+
+bad_delta <- ancestral_root_original %>%
+  filter(is.finite(primary_delta_from_best), primary_delta_from_best > primary_delta_warning)
+if (nrow(bad_delta) > 0) {
+  add_pipeline_warning(paste0(
+    "Primary model is worse than best overall model by > ",
+    primary_delta_warning,
+    " AICc for: ",
+    paste(bad_delta$variable, collapse = ", ")
+  ))
+}
+
+wide_ci <- ancestral_root_original %>%
+  filter(CI_extremely_wide)
+if (nrow(wide_ci) > 0) {
+  add_pipeline_warning(paste0(
+    "Extremely wide root CIs relative to extant ranges for: ",
+    paste(wide_ci$variable, collapse = ", ")
+  ))
+}
+
+root_projection_table <- ancestral_root_original %>%
   mutate(
     projection_value = if_else(is.finite(root_estimate), root_estimate, extant_mean),
     projection_value_source = if_else(
@@ -801,12 +1643,12 @@ root_projection_table <- ancestral_reconstruction_summary %>%
       "extant_mean_fallback_for_projection_only"
     ),
     variance_used_for_uncertainty = if_else(
-      is.finite(root_variance) & root_variance >= 0,
+      is.finite(root_variance) & root_variance > 0,
       root_variance,
       0
     ),
     uncertainty_source = if_else(
-      is.finite(root_variance) & root_variance >= 0,
+      is.finite(root_variance) & root_variance > 0,
       root_variance_source,
       "omitted_from_uncertainty"
     )
@@ -818,136 +1660,62 @@ root_projection_table <- ancestral_reconstruction_summary %>%
     variance_used_for_uncertainty,
     uncertainty_source
   )
+write_csv(root_projection_table, file.path(output_dir, "ancestral_root_vector_used_for_PCA_projection_strict.csv"))
 
-# -----------------------------
-# Visualization-only PCA
-# -----------------------------
-X_scaled <- scale(X)
-x_center <- attr(X_scaled, "scaled:center")
-x_scale <- attr(X_scaled, "scaled:scale")
-
-pca_vis <- prcomp(X_scaled, center = FALSE, scale. = FALSE)
-scores <- as.data.frame(pca_vis$x)
-colnames(scores) <- paste0("PC", seq_len(ncol(scores)))
-scores$tree_label <- rownames(X)
-
-loadings <- as.data.frame(pca_vis$rotation)
-colnames(loadings) <- paste0("PC", seq_len(ncol(loadings)))
-loadings$variable <- rownames(loadings)
-
-eigvals <- pca_vis$sdev^2
-eigenvalues <- tibble(
-  PC = paste0("PC", seq_along(eigvals)),
-  eigenvalue = eigvals,
-  variance_explained = eigvals / sum(eigvals),
-  cumulative_variance = cumsum(eigvals / sum(eigvals))
-)
-
-pc_count <- length(eigvals)
-candidate_pcs <- seq_len(min(4, pc_count))
-
-thermal_strength <- sapply(candidate_pcs, function(i) {
-  sum(abs(loadings[loadings$variable %in% thermal_vars, paste0("PC", i)]), na.rm = TRUE)
-})
-
-precip_strength <- sapply(candidate_pcs, function(i) {
-  sum(abs(loadings[loadings$variable %in% precip_vars, paste0("PC", i)]), na.rm = TRUE)
-})
-
-pc1_idx <- candidate_pcs[which.max(thermal_strength)]
-remaining <- setdiff(candidate_pcs, pc1_idx)
-if (length(remaining) == 0) {
-  stop("Could not choose a second PCA axis.")
-}
-pc2_idx <- remaining[which.max(precip_strength[match(remaining, candidate_pcs)])]
-
-pc1_sign <- sign(sum(loadings[loadings$variable %in% thermal_vars, paste0("PC", pc1_idx)], na.rm = TRUE))
-if (is.na(pc1_sign) || pc1_sign == 0) pc1_sign <- 1
-
-pc2_sign <- sign(sum(loadings[loadings$variable %in% precip_vars, paste0("PC", pc2_idx)], na.rm = TRUE))
-if (is.na(pc2_sign) || pc2_sign == 0) pc2_sign <- 1
-
-scores$PC1_thermal <- scores[[paste0("PC", pc1_idx)]] * pc1_sign
-scores$PC2_precipitation <- scores[[paste0("PC", pc2_idx)]] * pc2_sign
-
-loadings$PC1_thermal <- loadings[[paste0("PC", pc1_idx)]] * pc1_sign
-loadings$PC2_precipitation <- loadings[[paste0("PC", pc2_idx)]] * pc2_sign
-
-root_projection_vector <- root_projection_table$projection_value
-names(root_projection_vector) <- root_projection_table$variable
-
-root_scaled <- (root_projection_vector[names(x_center)] - x_center) / x_scale
-root_scores_all <- as.numeric(root_scaled %*% pca_vis$rotation)
-names(root_scores_all) <- colnames(pca_vis$x)
-
-root_center <- c(
-  PC1_thermal = unname(root_scores_all[paste0("PC", pc1_idx)]) * pc1_sign,
-  PC2_precipitation = unname(root_scores_all[paste0("PC", pc2_idx)]) * pc2_sign
-)
-
-projected_root_point <- tibble(
-  crown_node = crown_node,
-  tree_is_rooted_after_pruning = is.rooted(tree_pruned),
-  n_species_used = length(tree_pruned$tip.label),
-  PC1_thermal = as.numeric(root_center["PC1_thermal"]),
-  PC2_precipitation = as.numeric(root_center["PC2_precipitation"]),
-  projection_note = "root reconstructed in original variables; PCA used only for visualization"
-)
-
-# -----------------------------
-# Approximate uncertainty propagation into PCA space
-# -----------------------------
-root_var_vec <- root_projection_table$variance_used_for_uncertainty
-names(root_var_vec) <- root_projection_table$variable
-
-Sigma_root_original <- diag(root_var_vec[names(x_center)])
-rownames(Sigma_root_original) <- names(x_center)
-colnames(Sigma_root_original) <- names(x_center)
-
-S_inv <- diag(1 / x_scale)
-Sigma_root_scaled <- S_inv %*% Sigma_root_original %*% S_inv
-Sigma_root_pca <- t(pca_vis$rotation) %*% Sigma_root_scaled %*% pca_vis$rotation
-
-sign_mat <- diag(c(pc1_sign, pc2_sign))
-Sigma2 <- Sigma_root_pca[c(pc1_idx, pc2_idx), c(pc1_idx, pc2_idx), drop = FALSE]
-Sigma2 <- sign_mat %*% Sigma2 %*% sign_mat
-Sigma2 <- make_positive_definite(Sigma2)
-
-ellipse_eigenvalues <- eigen(Sigma2, symmetric = TRUE)$values
-ellipse_status <- if (all(ellipse_eigenvalues > 0)) "ok" else "nearPD_returned_nonpositive_eigenvalue"
-
-ell <- bind_rows(
-  make_ellipse(root_center, Sigma2, level = 0.50),
-  make_ellipse(root_center, Sigma2, level = 0.80),
-  make_ellipse(root_center, Sigma2, level = 0.95)
-)
-
-uncertainty_assumptions <- tibble(
-  assumption = c(
-    "original_variable_covariance",
-    "root_variance_source",
-    "unresolved_variables",
-    "positive_definite_guard"
-  ),
-  status = c(
-    "diagonal_only_cross_variable_covariance_not_estimated",
-    "CI95_width_converted_to_variance_when_needed",
-    collapse_flags(root_projection_table$variable[root_projection_table$uncertainty_source == "omitted_from_uncertainty"]),
-    ellipse_status
+if (save_intermediate_rds) {
+  saveRDS(
+    list(
+      model_fit_attempts = model_fit_attempts,
+      model_selection = model_selection,
+      ancestral_root_original = ancestral_root_original,
+      root_projection_table = root_projection_table,
+      sensitivity_comparison = sensitivity_comparison,
+      coherence_diagnostics = coherence_diagnostics
+    ),
+    file.path(cache_dir, "root_reconstruction_intermediate.rds")
   )
-)
+}
 
-scores_out <- scores %>%
+if (pipeline_stage == "root_reconstruction") {
+  message("Stage root_reconstruction complete. Stopping before PCA projection.")
+  quit(save = "no", status = 0)
+}
+
+# -----------------------------
+# Stage: visualization-only PCA projection
+# -----------------------------
+message("Running visualization-only PCA and projecting reconstructed root.")
+pca_obj <- run_visualization_pca(X, thermal_vars, precip_vars)
+
+scores_out <- pca_obj$scores %>%
   left_join(
     clim_final %>% select(tree_label, species_original, species_clean),
     by = "tree_label"
   ) %>%
-  relocate(species_original, species_clean, tree_label, PC1_thermal, PC2_precipitation)
+  relocate(species_original, species_clean, tree_label, display_PCx_oriented, display_PCy_oriented)
 
-d2 <- as.numeric(mahalanobis(
-  x = scores_out[, c("PC1_thermal", "PC2_precipitation")],
-  center = as.numeric(root_center),
-  cov = Sigma2
+projection <- project_root_to_pca(root_projection_table, pca_obj, scores_out)
+projected_root_point <- projection$root_point %>%
+  mutate(
+    crown_node = crown_node,
+    n_species_used = nrow(scores_out),
+    tree_is_rooted_after_pruning = is.rooted(tree_pruned),
+    projection_note = "root reconstructed in original variables; PCA used only for visualization",
+    .before = 1
+  )
+
+uncertainty_projection <- project_root_uncertainty_to_pca(
+  root_projection_table,
+  pca_obj,
+  root_center = projection$root_center,
+  extant_hull_area = projection$extant_hull_area
+)
+ellipse_df <- uncertainty_projection$ellipse
+
+core_md2 <- as.numeric(mahalanobis(
+  scores_out[, c("display_PCx_oriented", "display_PCy_oriented")],
+  center = projection$root_center,
+  cov = uncertainty_projection$cov
 ))
 
 core_membership <- scores_out %>%
@@ -955,247 +1723,134 @@ core_membership <- scores_out %>%
     species_original,
     species_clean,
     tree_label,
-    PC1_thermal,
-    PC2_precipitation,
-    mahalanobis_d2 = d2,
-    inside_50_core = mahalanobis_d2 <= qchisq(0.50, df = 2),
-    inside_80_core = mahalanobis_d2 <= qchisq(0.80, df = 2),
-    inside_95_core = mahalanobis_d2 <= qchisq(0.95, df = 2),
-    closest_core_level = case_when(
-      inside_50_core ~ "50%",
-      inside_80_core ~ "80%",
-      inside_95_core ~ "95%",
+    display_PCx_oriented,
+    display_PCy_oriented,
+    mahalanobis_d2_to_projected_root_uncertainty = core_md2,
+    inside_50_projected_root_ellipse = core_md2 <= qchisq(0.50, df = 2),
+    inside_80_projected_root_ellipse = core_md2 <= qchisq(0.80, df = 2),
+    inside_95_projected_root_ellipse = core_md2 <= qchisq(0.95, df = 2),
+    closest_projected_root_ellipse_level = case_when(
+      inside_50_projected_root_ellipse ~ "50%",
+      inside_80_projected_root_ellipse ~ "80%",
+      inside_95_projected_root_ellipse ~ "95%",
       TRUE ~ "outside_95%"
     )
   ) %>%
-  arrange(mahalanobis_d2)
+  arrange(mahalanobis_d2_to_projected_root_uncertainty)
 
-core_summary <- tibble(
-  result_block = "Result Block 1: Where did the radiation begin in climatic space?",
-  n_species_used = nrow(core_membership),
-  crown_node = crown_node,
-  tree_is_rooted = is.rooted(tree_pruned),
-  selected_thermal_axis = paste0("PC", pc1_idx),
-  selected_precipitation_axis = paste0("PC", pc2_idx),
-  thermal_axis_variance_explained = eigenvalues$variance_explained[pc1_idx],
-  precipitation_axis_variance_explained = eigenvalues$variance_explained[pc2_idx],
-  n_variables_with_sensitivity_best_model = sum(
-    ancestral_reconstruction_summary$best_overall_model %in% sensitivity_models,
-    na.rm = TRUE
-  ),
-  n_variables_with_primary_reconstruction = sum(is.finite(ancestral_reconstruction_summary$root_estimate)),
-  n_variables_omitted_from_uncertainty = sum(root_projection_table$uncertainty_source == "omitted_from_uncertainty"),
-  n_species_inside_50_core = sum(core_membership$inside_50_core),
-  n_species_inside_80_core = sum(core_membership$inside_80_core),
-  n_species_inside_95_core = sum(core_membership$inside_95_core),
-  pct_species_inside_50_core = mean(core_membership$inside_50_core),
-  pct_species_inside_80_core = mean(core_membership$inside_80_core),
-  pct_species_inside_95_core = mean(core_membership$inside_95_core),
-  uncertainty_assumption = "diagonal original-variable root uncertainty projected into PCA space"
+ellipse_95_ratio <- ellipse_df$ellipse_area_to_extant_hull_area_ratio[ellipse_df$confidence_level == 0.95][1]
+
+interpretability_metrics <- tibble(
+  number_of_usable_primary_variables = sum(ancestral_root_original$contributes_to_main_root_estimate),
+  proportion_of_variables_with_caution_flags = mean(ancestral_root_original$interpretability_flag != "none"),
+  number_of_variables_with_caution_flags = sum(ancestral_root_original$interpretability_flag != "none"),
+  median_primary_delta_from_best = median(ancestral_root_original$primary_delta_from_best, na.rm = TRUE),
+  number_of_variables_with_non_primary_best_model = sum(ancestral_root_original$best_overall_model %in% sensitivity_models),
+  number_of_variables_where_root_outside_extant_range = sum(!ancestral_root_original$root_lies_within_extant_observed_range, na.rm = TRUE),
+  root_mahalanobis_distance_squared_in_PCA_space = projection$root_md2,
+  root_mahalanobis_distance_in_PCA_space = sqrt(projection$root_md2),
+  extant_cloud_membership = projection$root_cloud_status,
+  root_inside_extant_convex_hull_displayed_2D = projection$root_inside_hull,
+  ellipse_95_area_to_extant_hull_area_ratio = ellipse_95_ratio,
+  covariance_condition_number = uncertainty_projection$cov_info$condition_number,
+  covariance_used_nearPD = uncertainty_projection$cov_info$used_near_pd
+)
+interpretability_metrics$final_classification <- classify_final_result(interpretability_metrics)
+
+write_csv(pca_obj$scores, file.path(output_dir, "visualization_only_PCA_species_scores.csv"))
+write_csv(pca_obj$loadings, file.path(output_dir, "visualization_only_PCA_loadings.csv"))
+write_csv(pca_obj$eigenvalues, file.path(output_dir, "visualization_only_PCA_eigenvalues.csv"))
+write_csv(projected_root_point, file.path(output_dir, "ancestral_root_projected_PCA_point_strict.csv"))
+write_csv(ellipse_df, file.path(output_dir, "ancestral_root_projected_PCA_ellipses_strict.csv"))
+write_csv(core_membership, file.path(output_dir, "species_membership_in_projected_root_ellipses_strict.csv"))
+write_csv(interpretability_metrics, file.path(output_dir, "ancestral_root_interpretability_metrics.csv"))
+write_csv(
+  tibble(warning = if (length(pipeline_warnings) == 0) "none" else unique(pipeline_warnings)),
+  file.path(output_dir, "pipeline_warnings_and_safeguards.csv")
 )
 
-write_csv(model_fit_table, file.path(output_dir, "strict_model_fits_by_variable.csv"))
-write_csv(ancestral_reconstruction_summary, file.path(output_dir, "strict_ancestral_reconstruction_by_variable.csv"))
-write_csv(root_projection_table, file.path(output_dir, "strict_root_vector_for_PCA_projection.csv"))
-write_csv(uncertainty_assumptions, file.path(output_dir, "strict_uncertainty_assumptions.csv"))
-write_csv(scores_out, file.path(output_dir, "visualization_PCA_species_scores.csv"))
-write_csv(loadings, file.path(output_dir, "visualization_PCA_loadings.csv"))
-write_csv(eigenvalues, file.path(output_dir, "visualization_PCA_eigenvalues.csv"))
-write_csv(projected_root_point, file.path(output_dir, "projected_primary_root_PCA_point.csv"))
-write_csv(ell, file.path(output_dir, "projected_primary_root_PCA_ellipses.csv"))
-write_csv(core_membership, file.path(output_dir, "strict_ancestral_core_species_membership.csv"))
-write_csv(core_summary, file.path(output_dir, "strict_ancestral_core_summary.csv"))
+write_interpretation_summary(
+  file.path(output_dir, "biological_interpretation_summary.txt"),
+  interpretability_metrics,
+  ancestral_root_original,
+  coherence_diagnostics,
+  sensitivity_comparison,
+  pipeline_warnings
+)
+
+writeLines(
+  c(
+    "# Result Block 1 Strict Ancestral Climate Output Summary",
+    "",
+    "Core statement supported by this pipeline:",
+    "\"Ancestral climate was reconstructed in the original environmental variables after per-variable evolutionary model fitting. PCA was used only to visualize extant climatic structure and the projected ancestral root. Variables whose best-supported model fell outside the primary reconstructable model set were retained as sensitivity cases and explicitly flagged.\"",
+    "",
+    "Read outputs in this order:",
+    "1. per_variable_model_fits.csv",
+    "2. ancestral_root_original_climate_strict.csv",
+    "3. sensitivity_comparison_summary.csv",
+    "4. cross_variable_climate_coherence_diagnostics.csv",
+    "5. ancestral_root_projected_PCA_point_strict.csv",
+    "6. ancestral_root_projected_PCA_ellipses_strict.csv",
+    "7. ancestral_root_interpretability_metrics.csv",
+    "8. biological_interpretation_summary.txt",
+    "",
+    "Important limitation:",
+    "The projected root ellipse uses diagonal per-variable root uncertainty and should not be described as a fully jointly inferred multivariate ancestral climatic niche.",
+    "",
+    paste0("Final classification: ", interpretability_metrics$final_classification)
+  ),
+  con = file.path(output_dir, "SUMMARY.md")
+)
 
 write_xlsx(
   list(
-    summary = core_summary,
-    model_fits_by_variable = model_fit_table,
-    ancestral_reconstruction = ancestral_reconstruction_summary,
-    root_vector_for_PCA_projection = root_projection_table,
-    uncertainty_assumptions = uncertainty_assumptions,
+    interpretability_metrics = interpretability_metrics,
+    per_variable_model_fits = per_variable_model_fits,
+    model_fit_attempts = model_fit_attempts,
+    ancestral_root_original = ancestral_root_original,
+    sensitivity_comparison = sensitivity_comparison,
+    coherence_diagnostics = coherence_diagnostics,
+    root_projection_vector = root_projection_table,
     projected_root_PCA_point = projected_root_point,
-    projected_root_PCA_ellipses = ell,
-    species_core_membership = core_membership,
-    visualization_PCA_scores = scores_out,
-    visualization_PCA_loadings = loadings,
-    visualization_PCA_eigenvalues = eigenvalues,
+    projected_root_PCA_ellipses = ellipse_df,
+    species_root_ellipse_membership = core_membership,
+    visualization_PCA_scores = pca_obj$scores,
+    visualization_PCA_loadings = pca_obj$loadings,
+    visualization_PCA_eigenvalues = pca_obj$eigenvalues,
     data_used = clim_final
   ),
-  path = file.path(output_dir, "strict_ancestral_climate_reconstruction_outputs.xlsx")
+  path = file.path(output_dir, "result_block_1_strict_ancestral_climate_outputs.xlsx")
 )
 
-arrow_mult <- 2.5
-thermal_arrows_df <- loadings %>%
-  filter(variable %in% thermal_vars) %>%
-  transmute(variable, x = PC1_thermal * arrow_mult, y = PC2_precipitation * arrow_mult)
+if (save_intermediate_rds) {
+  saveRDS(
+    list(
+      pca_obj = pca_obj,
+      projection = projection,
+      uncertainty_projection = uncertainty_projection,
+      interpretability_metrics = interpretability_metrics
+    ),
+    file.path(cache_dir, "pca_projection_intermediate.rds")
+  )
+}
 
-precip_arrows_df <- loadings %>%
-  filter(variable %in% precip_vars) %>%
-  transmute(variable, x = PC1_thermal * arrow_mult, y = PC2_precipitation * arrow_mult)
-
-label_df <- bind_rows(
-  core_membership %>% filter(inside_50_core) %>% slice_head(n = 15),
-  core_membership %>% slice_head(n = 10)
-) %>%
-  distinct(tree_label, .keep_all = TRUE)
-
-var_pc1 <- percent(eigenvalues$variance_explained[pc1_idx], accuracy = 0.1)
-var_pc2 <- percent(eigenvalues$variance_explained[pc2_idx], accuracy = 0.1)
-
-xlab_txt <- paste0("Thermal climatic gradient (PC", pc1_idx, ", ", var_pc1, ")")
-ylab_txt <- paste0("Precipitation climatic gradient (PC", pc2_idx, ", ", var_pc2, ")")
-
-p_core <- ggplot(scores_out, aes(x = PC1_thermal, y = PC2_precipitation)) +
-  geom_polygon(
-    data = ell,
-    aes(x = x, y = y, group = level, fill = level),
-    alpha = 0.16,
-    color = "black",
-    linewidth = 0.3,
-    inherit.aes = FALSE
-  ) +
-  geom_point(alpha = 0.28, size = 1.35, color = "grey35") +
-  geom_point(
-    data = core_membership %>% filter(inside_50_core),
-    aes(x = PC1_thermal, y = PC2_precipitation),
-    inherit.aes = FALSE,
-    size = 1.9,
-    color = "darkgreen",
-    alpha = 0.8
-  ) +
-  geom_point(
-    data = projected_root_point,
-    aes(x = PC1_thermal, y = PC2_precipitation),
-    inherit.aes = FALSE,
-    size = 3.3,
-    shape = 21,
-    fill = "red",
-    color = "black",
-    stroke = 0.5
-  ) +
-  geom_segment(
-    data = thermal_arrows_df,
-    aes(x = 0, y = 0, xend = x, yend = y),
-    inherit.aes = FALSE,
-    arrow = grid::arrow(length = grid::unit(0.18, "cm")),
-    linewidth = 0.45,
-    color = "firebrick"
-  ) +
-  geom_text(
-    data = thermal_arrows_df,
-    aes(x = x, y = y, label = variable),
-    inherit.aes = FALSE,
-    color = "firebrick",
-    size = 2.8
-  ) +
-  geom_segment(
-    data = precip_arrows_df,
-    aes(x = 0, y = 0, xend = x, yend = y),
-    inherit.aes = FALSE,
-    arrow = grid::arrow(length = grid::unit(0.18, "cm")),
-    linewidth = 0.45,
-    color = "steelblue4"
-  ) +
-  geom_text(
-    data = precip_arrows_df,
-    aes(x = x, y = y, label = variable),
-    inherit.aes = FALSE,
-    color = "steelblue4",
-    size = 2.8
-  ) +
-  ggrepel::geom_text_repel(
-    data = label_df,
-    aes(label = species_clean),
-    size = 2.5,
-    max.overlaps = 100,
-    box.padding = 0.18,
-    point.padding = 0.1,
-    min.segment.length = 0
-  ) +
-  geom_hline(yintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey55") +
-  geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey55") +
-  scale_fill_manual(values = c("50%" = "#1b9e77", "80%" = "#d95f02", "95%" = "#7570b3")) +
-  labs(
-    x = xlab_txt,
-    y = ylab_txt,
-    fill = "Projected root CI",
-    title = "Result Block 1: ancestral climatic origin of the crown radiation",
-    subtitle = "Root reconstructed in original climate variables; PCA used only for visualization"
-  ) +
-  theme_classic(base_size = 12)
-
-ggsave(
-  filename = file.path(output_dir, "strict_ancestral_climatic_core.png"),
-  plot = p_core,
-  width = 10,
-  height = 8,
-  dpi = 400
-)
-
-ggsave(
-  filename = file.path(output_dir, "strict_ancestral_climatic_core.pdf"),
-  plot = p_core,
-  width = 10,
-  height = 8
-)
-
-write_csv(thermal_arrows_df, file.path(output_dir, "thermal_loading_arrows.csv"))
-write_csv(precip_arrows_df, file.path(output_dir, "precipitation_loading_arrows.csv"))
-write_csv(label_df, file.path(output_dir, "species_labels_used_in_plot.csv"))
-
-summary_lines <- c(
-  "# Strict Ancestral Climate Reconstruction Summary",
-  "",
-  "Result Block 1: Where did the radiation begin in climatic space?",
-  "",
-  "Core statement supported by this pipeline:",
-  "\"Ancestral climate was reconstructed in the original environmental variables and then visualized in climatic PCA space.\"",
-  "",
-  paste0("Species used: ", core_summary$n_species_used),
-  paste0("Crown node: ", crown_node),
-  paste0("Tree rooted after pruning: ", core_summary$tree_is_rooted),
-  paste0(
-    "Selected visualization axes: thermal = ", core_summary$selected_thermal_axis,
-    ", precipitation = ", core_summary$selected_precipitation_axis
-  ),
-  paste0("Variables where best overall model was sensitivity-only: ", core_summary$n_variables_with_sensitivity_best_model),
-  paste0("Variables with primary reconstruction: ", core_summary$n_variables_with_primary_reconstruction),
-  paste0("Variables omitted from root uncertainty: ", core_summary$n_variables_omitted_from_uncertainty),
-  paste0("Species inside 50% projected ancestral core: ", core_summary$n_species_inside_50_core),
-  paste0("Species inside 80% projected ancestral core: ", core_summary$n_species_inside_80_core),
-  paste0("Species inside 95% projected ancestral core: ", core_summary$n_species_inside_95_core),
-  "",
-  "Primary inference models: BM, lambda, delta.",
-  "Sensitivity-only models: OU, EB, mean_trend.",
-  "OU is fit and flagged only; it is not forced into primary ancestral reconstruction.",
-  "EB and mean_trend get optional sensitivity-only root estimates when they are the best overall AICc model.",
-  "",
-  "Approximation/assumption flags:",
-  "- Root covariance is diagonal across original climate variables; cross-variable ancestral uncertainty is not estimated.",
-  "- ace() confidence intervals are converted to approximate variances when no direct root variance is available.",
-  "- Unresolved variables use extant means only for plotting the root point and are omitted from uncertainty propagation.",
-  "",
-  "Key outputs:",
-  "- strict_model_fits_by_variable.csv",
-  "- strict_ancestral_reconstruction_by_variable.csv",
-  "- strict_root_vector_for_PCA_projection.csv",
-  "- visualization_PCA_species_scores.csv",
-  "- projected_primary_root_PCA_point.csv",
-  "- projected_primary_root_PCA_ellipses.csv",
-  "- strict_ancestral_climatic_core.png",
-  "- strict_ancestral_climatic_core.pdf"
-)
-
-writeLines(summary_lines, con = file.path(output_dir, "SUMMARY.md"))
+if (!skip_plots && pipeline_stage %in% c("all", "plot")) {
+  make_plot(
+    scores_out = scores_out,
+    root_point = projected_root_point,
+    ellipse_df = ellipse_df,
+    loadings = pca_obj$loadings,
+    core_membership = core_membership,
+    eigenvalues = pca_obj$eigenvalues,
+    pca_obj = pca_obj
+  )
+} else {
+  message("Plot generation skipped.")
+}
 
 cat("\n==============================\n")
-cat("Strict ancestral reconstruction summary\n")
+cat("Result Block 1 strict workflow complete\n")
 cat("==============================\n")
-print(ancestral_reconstruction_summary)
-
-cat("\n==============================\n")
-cat("Projected ancestral core summary\n")
-cat("==============================\n")
-print(core_summary)
-
+print(interpretability_metrics)
 cat("\nFiles written to: ", output_dir, "\n", sep = "")
