@@ -217,6 +217,11 @@ setting, exact input paths, result directory, cache directory, expected key
 output for the selected stage, all files verified for that stage, and whether a
 previous fit cache was restored or the run is starting cold.
 
+The workflow opts JavaScript actions into Node 24 with
+`FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` and uses maintained action majors where
+available. If a run is canceled, diagnose the exact canceled step first; Node
+deprecation warnings are not automatically the cause of the failure.
+
 Each run writes:
 
 ```text
