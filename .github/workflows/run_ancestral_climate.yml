@@ -1,0 +1,183 @@
+name: Run ancestral climate pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Pipeline stage to run. Run stages in order for production."
+        required: true
+        default: "model_fit"
+        type: choice
+        options:
+          - model_fit
+          - root_reconstruction
+          - pca_projection
+          - plot
+      ncores:
+        description: "Number of cores to expose to geiger::fitContinuous via GEIGER_NCORES."
+        required: true
+        default: "4"
+        type: string
+      use_fit_cache:
+        description: "Restore/save the pipeline fitContinuous cache between cloud runs."
+        required: true
+        default: true
+        type: boolean
+      upload_results:
+        description: "Upload stage outputs as a GitHub Actions artifact."
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  RESULT_DIR: results/result_block_1_strict_ancestral_climate
+  FIT_CACHE_DIR: results/result_block_1_strict_ancestral_climate/cache
+  # Include the scientific script and primary inputs in the cache prefix.
+  # If the script, phylogeny, or climate table changes, old model-fit caches
+  # will not be restored for the new production run.
+  FIT_CACHE_PREFIX: ancestral-fit-cache-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}
+
+jobs:
+  run-ancestral-climate:
+    name: Run strict ancestral climate pipeline (${{ inputs.stage }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show requested run configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Stage: ${{ inputs.stage }}"
+          echo "GEIGER_NCORES: ${{ inputs.ncores }}"
+          echo "Use fit cache: ${{ inputs.use_fit_cache }}"
+          echo "Upload results: ${{ inputs.upload_results }}"
+          echo "Result directory: ${RESULT_DIR}"
+          echo "Fit cache directory: ${FIT_CACHE_DIR}"
+
+      - name: Install Linux system libraries for R packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            gfortran \
+            make \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            libxml2-dev \
+            libgit2-dev \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libfribidi-dev \
+            libharfbuzz-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libtiff5-dev \
+            libglpk-dev \
+            libgmp3-dev \
+            libudunits2-dev \
+            qpdf
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: "release"
+          use-public-rspm: true
+
+      - name: Install and cache R package dependencies
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          cache: true
+          cache-version: result-block-1-r-packages-v1
+          packages: |
+            any::ape
+            any::geiger
+            any::phytools
+            any::dplyr
+            any::readr
+            any::stringr
+            any::ggplot2
+            any::ggrepel
+            any::tibble
+            any::writexl
+            any::scales
+            any::Matrix
+            any::sessioninfo
+
+      - name: Prepare result and cache directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RESULT_DIR}" "${FIT_CACHE_DIR}"
+
+      - name: Restore fitContinuous cache
+        id: restore-fit-cache
+        if: ${{ inputs.use_fit_cache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.FIT_CACHE_DIR }}
+          # This key is deliberately unique for this run. The restore key below
+          # pulls the newest cache with the same script/data hash, and the save
+          # step writes a fresh immutable cache after a successful run.
+          key: ${{ env.FIT_CACHE_PREFIX }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ env.FIT_CACHE_PREFIX }}-
+
+      - name: Record artifact name
+        id: artifact
+        shell: bash
+        env:
+          STAGE: ${{ inputs.stage }}
+        run: |
+          set -euo pipefail
+          echo "name=ancestral-climate-${STAGE//_/-}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run selected pipeline stage
+        shell: bash
+        env:
+          GEIGER_NCORES: ${{ inputs.ncores }}
+          RESUME_MODEL_CACHE: ${{ inputs.use_fit_cache }}
+          SAVE_INTERMEDIATE_RDS: "true"
+          OUTPUT_DIR: ${{ env.RESULT_DIR }}
+        run: |
+          set -euo pipefail
+
+          cache_args=()
+          if [[ "${{ inputs.use_fit_cache }}" != "true" ]]; then
+            cache_args+=(--no-resume-model-cache)
+          fi
+
+          echo "Running strict ancestral climate script..."
+          Rscript scripts/run_ancestral_climate_reconstruction.R \
+            --stage="${{ inputs.stage }}" \
+            "${cache_args[@]}"
+
+          echo "Files currently present in ${RESULT_DIR}:"
+          find "${RESULT_DIR}" -maxdepth 3 -type f -print | sort
+
+      - name: Save fitContinuous cache
+        if: ${{ success() && inputs.use_fit_cache }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.FIT_CACHE_DIR }}
+          key: ${{ env.FIT_CACHE_PREFIX }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Upload stage results
+        if: ${{ always() && inputs.upload_results }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact.outputs.name }}
+          path: |
+            results/result_block_1_strict_ancestral_climate/**
+            !results/result_block_1_strict_ancestral_climate/cache/**
+          if-no-files-found: warn
+          retention-days: 30

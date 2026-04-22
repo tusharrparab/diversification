@@ -137,6 +137,50 @@ Equivalent environment variables:
 - `SAVE_INTERMEDIATE_RDS`
 - `MIN_VALID_VALUES`
 
+## Cloud Runs With GitHub Actions
+
+The production pipeline can be run manually in GitHub Actions:
+
+1. Open the repository on GitHub.
+2. Go to **Actions**.
+3. Select **Run ancestral climate pipeline**.
+4. Click **Run workflow**.
+5. Choose the stage and core count.
+
+Run the cloud stages in this order:
+
+1. `model_fit`
+2. `root_reconstruction`
+3. `pca_projection`
+4. `plot`
+
+The `model_fit` stage is the main computational bottleneck because it runs
+`geiger::fitContinuous()` repeatedly across climate variables and candidate
+models. The workflow restores and saves the pipeline cache directory:
+
+```text
+results/result_block_1_strict_ancestral_climate/cache/
+```
+
+Cache keys include the R script, the pruned phylogeny, and the climate table, so
+cached model fits are invalidated when relevant inputs change.
+
+Each cloud run uploads a stage-specific artifact, for example:
+
+- `ancestral-climate-model-fit`
+- `ancestral-climate-root-reconstruction`
+- `ancestral-climate-pca-projection`
+- `ancestral-climate-plot`
+
+After cloud runs, inspect the biological outputs first:
+
+- `per_variable_model_fits.csv`
+- `ancestral_root_original_climate_strict.csv`
+- `biological_interpretation_summary.txt`
+
+Then inspect the PCA outputs as visualization and diagnostic products. They are
+not the primary inferential basis.
+
 ## Key Outputs
 
 Outputs are written to:
