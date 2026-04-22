@@ -139,7 +139,22 @@ Equivalent environment variables:
 
 ## Cloud Runs With GitHub Actions
 
-The production pipeline can be run manually in GitHub Actions:
+The cloud workflow is:
+
+```text
+.github/workflows/run_ancestral_climate.yml
+```
+
+It is manual-only because its only trigger is `workflow_dispatch`. Pushing code
+does not run the models. GitHub documents `workflow_dispatch` as the manual
+workflow trigger, with manual starts supported from the Actions tab, GitHub CLI,
+or REST API; GitHub also notes that the workflow file must exist on the default
+branch for manual dispatch to be available.
+
+- [GitHub: manually running a workflow](https://docs.github.com/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+- [GitHub: `workflow_dispatch` event](https://docs.github.com/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
+
+To start the production pipeline from the GitHub UI:
 
 1. Open the repository on GitHub.
 2. Go to **Actions**.
@@ -147,7 +162,20 @@ The production pipeline can be run manually in GitHub Actions:
 4. Click **Run workflow**.
 5. Choose the stage and core count.
 
-Run the cloud stages in this order:
+You can also dispatch it with GitHub CLI:
+
+```sh
+gh workflow run run_ancestral_climate.yml \
+  -f stage=model_fit \
+  -f ncores=4 \
+  -f use_fit_cache=true \
+  -f upload_results=true
+```
+
+Or use the GitHub REST API workflow-dispatch endpoint for
+`run_ancestral_climate.yml`.
+
+Run the cloud stages manually in this order:
 
 1. `model_fit`
 2. `root_reconstruction`
@@ -164,6 +192,39 @@ results/result_block_1_strict_ancestral_climate/cache/
 
 Cache keys include the R script, the pruned phylogeny, and the climate table, so
 cached model fits are invalidated when relevant inputs change.
+
+Before installing R packages or starting model runtime, the workflow checks that
+these required paths exist:
+
+- `scripts/run_ancestral_climate_reconstruction.R`
+- `data/raw/pruned_phylogeny.nex`
+- `data/raw/climate.csv`
+
+The workflow log also prints the selected stage, `GEIGER_NCORES`, fit-cache
+setting, exact input paths, result directory, cache directory, and whether a
+previous fit cache was restored or the run is starting cold.
+
+To confirm that `fitContinuous()` actually ran on real data, inspect the run log
+for the model-fit loop:
+
+- `Fitting or loading per-variable geiger::fitContinuous model fits.`
+- `fitting all candidate models for <variable>`
+- `<variable> under <model>`
+
+If the workflow restored previous fits, the log instead reports
+`using cached fitContinuous fits for <variable>`. That confirms the stage reused
+the fit cache rather than refitting that variable from scratch.
+
+For a `model_fit`-only run, the stage completion proof is the uploaded artifact
+containing non-empty:
+
+- `per_variable_model_fit_attempts_detailed.csv`
+- `per_variable_model_selection_preliminary.csv`
+
+`per_variable_model_fits.csv` is produced by the next stage,
+`root_reconstruction`, after the cached/raw model fits are assembled with the
+root-reconstruction diagnostics. Treat it as the first compact biological
+model-fit summary, not as a file emitted by a `model_fit`-only run.
 
 Each cloud run uploads a stage-specific artifact, for example:
 

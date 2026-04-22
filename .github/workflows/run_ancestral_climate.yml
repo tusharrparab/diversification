@@ -1,10 +1,19 @@
 name: Run ancestral climate pipeline
 
+# This cloud workflow is manual-only. The only trigger is workflow_dispatch:
+# pushing commits does not run the ancestral climate models.
+# Start it deliberately from the GitHub Actions tab, GitHub CLI
+# (`gh workflow run`), or the REST API. GitHub documents workflow_dispatch as
+# the manual trigger, and the workflow file must be present on the default
+# branch for manual dispatch to be available.
+# Docs:
+# https://docs.github.com/actions/how-tos/manage-workflow-runs/manually-run-a-workflow
+# https://docs.github.com/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch
 on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "Pipeline stage to run. Run stages in order for production."
+        description: "Pipeline stage to run manually. Production order: model_fit -> root_reconstruction -> pca_projection -> plot."
         required: true
         default: "model_fit"
         type: choice
@@ -33,6 +42,9 @@ permissions:
   contents: read
 
 env:
+  SCRIPT_FILE: scripts/run_ancestral_climate_reconstruction.R
+  TREE_FILE: data/raw/pruned_phylogeny.nex
+  CLIMATE_FILE: data/raw/climate.csv
   RESULT_DIR: results/result_block_1_strict_ancestral_climate
   FIT_CACHE_DIR: results/result_block_1_strict_ancestral_climate/cache
   # Include the scientific script and primary inputs in the cache prefix.
@@ -50,14 +62,48 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Validate required input files before cloud runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking required files before installing R packages or starting model runtime."
+          missing=0
+          required_paths=(
+            "${SCRIPT_FILE}"
+            "${TREE_FILE}"
+            "${CLIMATE_FILE}"
+          )
+
+          for path in "${required_paths[@]}"; do
+            if [[ ! -f "${path}" ]]; then
+              echo "::error file=${path}::Required input file is missing: ${path}"
+              missing=1
+            else
+              bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
+              echo "Found ${path} (${bytes} bytes)"
+            fi
+          done
+
+          if [[ "${missing}" -ne 0 ]]; then
+            echo "Stopping before any expensive cloud setup because required input files are missing."
+            exit 1
+          fi
+
       - name: Show requested run configuration
         shell: bash
         run: |
           set -euo pipefail
-          echo "Stage: ${{ inputs.stage }}"
+          echo "Manual dispatch summary"
+          echo "This workflow is manual-only; pushes do not run it."
+          echo "Required production stage order: model_fit -> root_reconstruction -> pca_projection -> plot"
+          echo "Selected stage: ${{ inputs.stage }}"
           echo "GEIGER_NCORES: ${{ inputs.ncores }}"
-          echo "Use fit cache: ${{ inputs.use_fit_cache }}"
+          echo "Fit cache restore/save enabled: ${{ inputs.use_fit_cache }}"
           echo "Upload results: ${{ inputs.upload_results }}"
+          echo "Scientific script: ${SCRIPT_FILE}"
+          echo "Tree input: ${TREE_FILE}"
+          echo "Climate input: ${CLIMATE_FILE}"
           echo "Result directory: ${RESULT_DIR}"
           echo "Fit cache directory: ${FIT_CACHE_DIR}"
 
@@ -132,6 +178,36 @@ jobs:
           restore-keys: |
             ${{ env.FIT_CACHE_PREFIX }}-
 
+      - name: Report fit cache restore status
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ inputs.use_fit_cache }}" != "true" ]]; then
+            echo "Fit cache restore disabled for this manual run."
+          elif [[ -n "${{ steps.restore-fit-cache.outputs.cache-matched-key }}" ]]; then
+            echo "Fit cache restored from key:"
+            echo "${{ steps.restore-fit-cache.outputs.cache-matched-key }}"
+          else
+            echo "No previous fit cache was restored. This run is starting cold for fitContinuous cache files."
+          fi
+
+      - name: Write cloud run trace metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "workflow_name=${GITHUB_WORKFLOW}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "stage=${{ inputs.stage }}"
+            echo "commit_sha=${GITHUB_SHA}"
+            echo "git_ref=${GITHUB_REF}"
+            date -u +"started_at_utc=%Y-%m-%dT%H:%M:%SZ"
+          } > "${RESULT_DIR}/cloud_run_trace.txt"
+
       - name: Record artifact name
         id: artifact
         shell: bash
@@ -157,12 +233,84 @@ jobs:
           fi
 
           echo "Running strict ancestral climate script..."
-          Rscript scripts/run_ancestral_climate_reconstruction.R \
+          Rscript "${SCRIPT_FILE}" \
             --stage="${{ inputs.stage }}" \
             "${cache_args[@]}"
 
-          echo "Files currently present in ${RESULT_DIR}:"
-          find "${RESULT_DIR}" -maxdepth 3 -type f -print | sort
+      - name: Print top-level output files
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "${RESULT_DIR}" ]]; then
+            echo "Result directory does not exist yet: ${RESULT_DIR}"
+            exit 0
+          fi
+
+          echo "Top-level files currently present in ${RESULT_DIR}:"
+          find "${RESULT_DIR}" -maxdepth 1 -type f -printf "%f\n" | sort || true
+
+      - name: Verify selected stage outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ inputs.stage }}" in
+            model_fit)
+              echo "Verifying model_fit outputs."
+              echo "The model_fit stage intentionally stops before root reconstruction."
+              echo "per_variable_model_fits.csv is produced by the root_reconstruction stage, not by a model_fit-only run."
+              required_outputs=(
+                "${RESULT_DIR}/per_variable_model_fit_attempts_detailed.csv"
+                "${RESULT_DIR}/per_variable_model_selection_preliminary.csv"
+              )
+              ;;
+            root_reconstruction)
+              echo "Verifying root_reconstruction outputs."
+              required_outputs=(
+                "${RESULT_DIR}/per_variable_model_fits.csv"
+                "${RESULT_DIR}/ancestral_root_original_climate_strict.csv"
+              )
+              ;;
+            pca_projection)
+              echo "Verifying pca_projection outputs."
+              required_outputs=(
+                "${RESULT_DIR}/ancestral_root_projected_PCA_point_strict.csv"
+                "${RESULT_DIR}/ancestral_root_projected_PCA_ellipses_strict.csv"
+                "${RESULT_DIR}/biological_interpretation_summary.txt"
+              )
+              ;;
+            plot)
+              echo "Verifying plot outputs."
+              required_outputs=(
+                "${RESULT_DIR}/ancestral_root_projected_PCA_strict_plot.png"
+                "${RESULT_DIR}/ancestral_root_projected_PCA_strict_plot.pdf"
+              )
+              ;;
+            *)
+              echo "::error::Unsupported stage: ${{ inputs.stage }}"
+              exit 1
+              ;;
+          esac
+
+          missing=0
+          for path in "${required_outputs[@]}"; do
+            if [[ ! -s "${path}" ]]; then
+              echo "::error file=${path}::Expected output for stage '${{ inputs.stage }}' was not produced or is empty: ${path}"
+              missing=1
+            else
+              bytes="$(wc -c < "${path}" | tr -d '[:space:]')"
+              echo "Verified ${path} (${bytes} bytes)"
+            fi
+          done
+
+          if [[ "${missing}" -ne 0 ]]; then
+            echo "Selected stage did not produce all expected outputs."
+            exit 1
+          fi
+
+          echo "Stage '${{ inputs.stage }}' produced the expected output files."
 
       - name: Save fitContinuous cache
         if: ${{ success() && inputs.use_fit_cache }}
@@ -175,7 +323,7 @@ jobs:
         if: ${{ always() && inputs.upload_results }}
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.artifact.outputs.name }}
+          name: ${{ steps.artifact.outputs.name || format('ancestral-climate-{0}', inputs.stage) }}
           path: |
             results/result_block_1_strict_ancestral_climate/**
             !results/result_block_1_strict_ancestral_climate/cache/**
