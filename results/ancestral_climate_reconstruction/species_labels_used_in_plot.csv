@@ -1,0 +1,16 @@
+species_original,species_clean,tree_label,PC1_thermal,PC2_precipitation,mahalanobis_d2,inside_50_core,inside_80_core,inside_95_core,closest_core_level
+Tangara cyanocephala,tangara cyanocephala,tangara_cyanocephala,-0.36961604270285403,-0.23389591341958677,6.726228909391606e-5,TRUE,TRUE,TRUE,50%
+Heliangelus clarisse,heliangelus clarisse,heliangelus_clarisse,-0.33084586775748354,-0.23734299044401225,2.4666571371334935e-4,TRUE,TRUE,TRUE,50%
+Gyps africanus,gyps africanus,gyps_africanus,-0.3868137373896599,-0.22797913564423095,2.5652563305287126e-4,TRUE,TRUE,TRUE,50%
+Glaucidium perlatum,glaucidium perlatum,glaucidium_perlatum,-0.33781783345749045,-0.28120594466108395,2.9953383143091527e-4,TRUE,TRUE,TRUE,50%
+Pardirallus maculatus,pardirallus maculatus,pardirallus_maculatus,-0.3544055507069234,-0.20958505661506044,3.286929629899829e-4,TRUE,TRUE,TRUE,50%
+Saltator cinctus,saltator cinctus,saltator_cinctus,-0.34152025662653446,-0.28677265233905574,3.4046171717508507e-4,TRUE,TRUE,TRUE,50%
+Serinus nigriceps,serinus nigriceps,serinus_nigriceps,-0.3200369435902396,-0.23095618168886212,4.8253959818734106e-4,TRUE,TRUE,TRUE,50%
+Zosterops poliogastrus,zosterops poliogastrus,zosterops_poliogastrus,-0.31586559719125507,-0.27115426675775695,5.423949648414015e-4,TRUE,TRUE,TRUE,50%
+Dicrurus adsimilis,dicrurus adsimilis,dicrurus_adsimilis,-0.31365850118733035,-0.2681925262886219,5.706228733490232e-4,TRUE,TRUE,TRUE,50%
+Laterallus flaviventer,laterallus flaviventer,laterallus_flaviventer,-0.36316734529331846,-0.19563089134857792,5.724087335764747e-4,TRUE,TRUE,TRUE,50%
+Trigonoceps occipitalis,trigonoceps occipitalis,trigonoceps_occipitalis,-0.38523763843169884,-0.1981513056829352,6.436013956745983e-4,TRUE,TRUE,TRUE,50%
+Caprimulgus tristigma,caprimulgus tristigma,caprimulgus_tristigma,-0.40179154790643146,-0.21263600800821392,6.621221907649192e-4,TRUE,TRUE,TRUE,50%
+Scytalopus gonzagai,scytalopus gonzagai,scytalopus_gonzagai,-0.41263400454597926,-0.25354695092542695,7.136733316446744e-4,TRUE,TRUE,TRUE,50%
+Ardea melanocephala,ardea melanocephala,ardea_melanocephala,-0.31032884483153933,-0.2851638921453858,0.00080612627170103895,TRUE,TRUE,TRUE,50%
+Ortyxelos meiffrenii,ortyxelos meiffrenii,ortyxelos_meiffrenii,-0.4200835046709601,-0.23790927033281303,9.1703895653754e-4,TRUE,TRUE,TRUE,50%
