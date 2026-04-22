@@ -179,7 +179,9 @@ You can also dispatch it with GitHub CLI:
 ```sh
 gh workflow run run_ancestral_climate.yml \
   -f stage=model_fit \
-  -f ncores=4 \
+  -f ncores=1 \
+  -f model_fit_variable=all \
+  -f model_fit_model=all \
   -f use_fit_cache=true \
   -f upload_results=true
 ```
@@ -205,6 +207,31 @@ results/result_block_1_strict_ancestral_climate/cache/
 Cache keys include the R script, the pruned phylogeny, and the climate table, so
 cached model fits are invalidated when relevant inputs change.
 
+GitHub-hosted jobs have a hard 6-hour execution cap. Setting a longer
+`timeout-minutes` value in the workflow does not override that hosted-runner
+limit. If a full `model_fit` run reaches the 6-hour cap, do not treat that as a
+scientific failure or as completed fitting. Run bounded `model_fit` shards
+instead:
+
+```sh
+gh workflow run run_ancestral_climate.yml \
+  -f stage=model_fit \
+  -f ncores=1 \
+  -f model_fit_variable=annual_mean_temperature \
+  -f model_fit_model=BM \
+  -f use_fit_cache=true \
+  -f upload_results=true
+```
+
+Use `model_fit_variable=<climate variable>` with `model_fit_model=all` for
+variables that finish comfortably under the cap. If a variable is still too slow,
+use `model_fit_model=BM`, `OU`, `EB`, `lambda`, `delta`, or `mean_trend` to run
+one candidate model at a time. Each successful shard writes a per-variable
+`fitContinuous` cache file and saves it through the workflow cache. After all
+variable/model shards have completed, run `model_fit` again with
+`model_fit_variable=all` and `model_fit_model=all`. That final cached aggregation
+loads the saved fits and writes the canonical model-fit proof files.
+
 Before installing R packages or starting model runtime, the workflow checks that
 these required paths exist:
 
@@ -213,9 +240,10 @@ these required paths exist:
 - `data/raw/climate.csv`
 
 The workflow log also prints the selected stage, `GEIGER_NCORES`, fit-cache
-setting, exact input paths, result directory, cache directory, expected key
-output for the selected stage, all files verified for that stage, and whether a
-previous fit cache was restored or the run is starting cold.
+setting, model-fit shard controls, exact input paths, result directory, cache
+directory, expected key output for the selected stage, all files verified for
+that stage, and whether a previous fit cache was restored or the run is starting
+cold.
 
 The workflow opts JavaScript actions into Node 24 with
 `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true` and uses maintained action majors where
@@ -236,7 +264,8 @@ The workflow verifies these real script outputs by stage:
 
 | Stage | Files required by the workflow |
 | --- | --- |
-| `model_fit` | `per_variable_model_fit_attempts_detailed.csv`; `per_variable_model_selection_preliminary.csv` |
+| `model_fit` final aggregation (`model_fit_variable=all`, `model_fit_model=all`) | `per_variable_model_fit_attempts_detailed.csv`; `per_variable_model_selection_preliminary.csv` |
+| `model_fit` shard | `model_fit_shard_attempts.csv`; `model_fit_shard_completion.txt`; the relevant `cache/*_fitContinuous_cache.rds` file; `model_fit_shard_selection.csv` when all candidate models for a variable were requested |
 | `root_reconstruction` | `per_variable_model_fits.csv`; `ancestral_root_original_climate_strict.csv`; `sensitivity_comparison_summary.csv`; `cross_variable_climate_coherence_diagnostics.csv`; `ancestral_root_vector_used_for_PCA_projection_strict.csv` |
 | `pca_projection` | `ancestral_root_projected_PCA_point_strict.csv`; `ancestral_root_projected_PCA_ellipses_strict.csv`; `ancestral_root_interpretability_metrics.csv`; `biological_interpretation_summary.txt`; `result_block_1_strict_ancestral_climate_outputs.xlsx` |
 | `plot` | `ancestral_root_projected_PCA_strict_plot.png`; `ancestral_root_projected_PCA_strict_plot.pdf` |
@@ -245,15 +274,18 @@ To confirm that `fitContinuous()` actually ran on real data, inspect a real
 workflow run log for the model-fit loop:
 
 - `Fitting or loading per-variable geiger::fitContinuous model fits.`
-- `fitting all candidate models for <variable>`
+- `fitting or loading all candidate models for <variable>`
+- `fitting or loading selected candidate models for <variable>: <model>`
 - `<variable> under <model>`
 
 If the workflow restored previous fits, the log instead reports
-`using cached fitContinuous fits for <variable>`. That confirms the stage reused
-the fit cache rather than refitting that variable from scratch.
+`using cached fitContinuous cache for <variable>` or
+`using cached fitContinuous fit for <variable> under <model>`. That confirms the
+stage reused the fit cache rather than refitting that variable/model from
+scratch.
 
-For a `model_fit`-only run, the stage completion proof is the uploaded artifact
-for that GitHub Actions run containing non-empty:
+For a final `model_fit` aggregation run, the stage completion proof is the
+uploaded artifact for that GitHub Actions run containing non-empty:
 
 - `per_variable_model_fit_attempts_detailed.csv`
 - `per_variable_model_selection_preliminary.csv`
@@ -261,6 +293,13 @@ for that GitHub Actions run containing non-empty:
 The verifier fails the run if either file is missing or empty. The first file is
 the detailed per-model attempt table; the second is written only when the
 `model_fit` stage reaches its intended stopping point.
+
+For a shard run, proof is different: the run must verify
+`model_fit_shard_completion.txt`, `model_fit_shard_attempts.csv`, and the
+corresponding per-variable cache file. A shard proves that bounded
+`fitContinuous` work completed and was cached; it is not the final proof that
+all models completed. The final proof still comes from the all/all cached
+aggregation files above.
 
 `per_variable_model_fits.csv` is produced by the next stage,
 `root_reconstruction`, after the cached/raw model fits are assembled with the
