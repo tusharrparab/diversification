@@ -51,6 +51,7 @@ permissions:
   contents: read
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   SCRIPT_FILE: scripts/run_ancestral_climate_reconstruction.R
   TREE_FILE: data/raw/pruned_phylogeny.nex
   CLIMATE_FILE: data/raw/climate.csv
@@ -65,10 +66,41 @@ jobs:
     timeout-minutes: 1440
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - name: "00 diagnostics: workflow dispatch context"
+        shell: bash
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          echo "Workflow: ${GITHUB_WORKFLOW}"
+          echo "Run ID: ${GITHUB_RUN_ID}"
+          echo "Run attempt: ${GITHUB_RUN_ATTEMPT}"
+          echo "Event: ${GITHUB_EVENT_NAME}"
+          echo "Ref: ${GITHUB_REF}"
+          echo "SHA: ${GITHUB_SHA}"
+          echo "Selected stage: ${{ inputs.stage }}"
+          echo "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=${FORCE_JAVASCRIPT_ACTIONS_TO_NODE24}"
+          echo "Runner OS: ${RUNNER_OS}"
+          echo "Runner arch: ${RUNNER_ARCH}"
+          date -u +"Workflow diagnostics started at UTC: %Y-%m-%dT%H:%M:%SZ"
 
-      - name: Validate required input files before cloud runtime
+      - name: "01 checkout repository (actions/checkout@v6)"
+        uses: actions/checkout@v6
+        continue-on-error: false
+
+      - name: "01 diagnostics: checkout result"
+        shell: bash
+        continue-on-error: false
+        run: |
+          set -euo pipefail
+          echo "Checkout completed."
+          echo "Workspace: ${GITHUB_WORKSPACE}"
+          git status --short --branch
+          git rev-parse --verify HEAD
+          git log --oneline -1
+          ls -la .github/workflows
+
+      - name: "02 validate required production inputs (fail-fast)"
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
@@ -97,8 +129,9 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve selected stage outputs and artifact name
+      - name: "03 resolve selected stage outputs and artifact name"
         id: stage
+        continue-on-error: false
         shell: bash
         env:
           STAGE: ${{ inputs.stage }}
@@ -161,7 +194,8 @@ jobs:
           echo "EXPECTED_STAGE_NOTE=${stage_note}" >> "${GITHUB_ENV}"
           echo "EXPECTED_ARTIFACT_NAME=${artifact_name}" >> "${GITHUB_ENV}"
 
-      - name: Show requested run configuration
+      - name: "04 pre-run execution summary"
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
@@ -187,7 +221,8 @@ jobs:
           echo "Stage note: ${EXPECTED_STAGE_NOTE}"
           echo "Artifact name if upload_results=true: ${EXPECTED_ARTIFACT_NAME}"
 
-      - name: Install Linux system libraries for R packages
+      - name: "05 install Linux system libraries for R packages"
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
@@ -213,14 +248,49 @@ jobs:
             libudunits2-dev \
             qpdf
 
-      - name: Set up R
+      - name: "06 diagnostics: runner before setup-r"
+        continue-on-error: false
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner OS: ${RUNNER_OS}"
+          echo "Kernel:"
+          uname -a
+          echo "Disk space before R setup:"
+          df -h
+          echo "Memory before R setup:"
+          if command -v free >/dev/null 2>&1; then
+            free -h
+          else
+            echo "free command unavailable on this runner."
+          fi
+          echo "Node executable visible to shell:"
+          command -v node || true
+          node --version || true
+
+      - name: "07 set up R (r-lib/actions/setup-r@v2)"
         uses: r-lib/actions/setup-r@v2
+        continue-on-error: false
         with:
           r-version: "release"
           use-public-rspm: true
 
-      - name: Install and cache R package dependencies
+      - name: "07 diagnostics: R after setup-r"
+        continue-on-error: false
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "R executable:"
+          command -v R
+          R --version
+          echo "Rscript executable:"
+          command -v Rscript
+          Rscript -e 'cat("R version string: ", R.version.string, "\n", sep = "")'
+          Rscript -e 'cat("R library paths:\n"); print(.libPaths())'
+
+      - name: "08 install/cache R package dependencies (r-lib/actions/setup-r-dependencies@v2)"
         uses: r-lib/actions/setup-r-dependencies@v2
+        continue-on-error: false
         with:
           cache: true
           cache-version: result-block-1-r-packages-v1
@@ -239,16 +309,27 @@ jobs:
             any::Matrix
             any::sessioninfo
 
-      - name: Prepare result and cache directories
+      - name: "08 diagnostics: R package dependency setup completed"
+        continue-on-error: false
+        shell: bash
+        run: |
+          set -euo pipefail
+          Rscript -e 'pkgs <- c("ape", "geiger", "phytools", "dplyr", "readr", "ggplot2"); print(installed.packages()[pkgs, c("Package", "Version"), drop = FALSE])'
+
+      - name: "09 prepare result and fit cache directories"
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "${RESULT_DIR}" "${FIT_CACHE_DIR}"
+          echo "Prepared result directory: ${RESULT_DIR}"
+          echo "Prepared fit cache directory: ${FIT_CACHE_DIR}"
 
-      - name: Restore fitContinuous cache
+      - name: "10 restore fitContinuous cache (actions/cache/restore@v5)"
         id: restore-fit-cache
         if: ${{ inputs.use_fit_cache }}
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
+        continue-on-error: false
         with:
           path: ${{ env.FIT_CACHE_DIR }}
           # This key is deliberately unique for this run. The restore key below
@@ -260,8 +341,9 @@ jobs:
           restore-keys: |
             ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-
 
-      - name: Report fit cache restore status
+      - name: "10 diagnostics: fit cache restore result"
         if: ${{ always() }}
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
@@ -278,7 +360,8 @@ jobs:
             echo "No previous fit cache was restored. This run is starting cold for fitContinuous cache files."
           fi
 
-      - name: Write cloud run trace metadata
+      - name: "11 write cloud run trace metadata"
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
@@ -306,7 +389,32 @@ jobs:
             echo "artifact_name=${EXPECTED_ARTIFACT_NAME}"
           } > "${RESULT_DIR}/cloud_run_trace.txt"
 
-      - name: Run selected pipeline stage
+      - name: "12 diagnostics: runner resources before R stage"
+        continue-on-error: false
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Runner OS: ${RUNNER_OS}"
+          echo "Runner arch: ${RUNNER_ARCH}"
+          echo "Kernel:"
+          uname -a
+          echo "Disk space before R stage:"
+          df -h
+          echo "Memory before R stage:"
+          if command -v free >/dev/null 2>&1; then
+            free -h
+          else
+            echo "free command unavailable on this runner."
+          fi
+          echo "Node visible to shell:"
+          command -v node || true
+          node --version || true
+          echo "R version after setup-r:"
+          R --version
+          Rscript -e 'cat("R version string: ", R.version.string, "\n", sep = "")'
+
+      - name: "13 run selected R pipeline stage (${{ inputs.stage }})"
+        continue-on-error: false
         shell: bash
         env:
           GEIGER_NCORES: ${{ inputs.ncores }}
@@ -327,7 +435,8 @@ jobs:
             --stage="${{ inputs.stage }}" \
             "${cache_args[@]}"
 
-      - name: Verify selected stage outputs
+      - name: "14 verify selected stage outputs"
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
@@ -362,7 +471,7 @@ jobs:
           echo "Expected key output verified: ${EXPECTED_KEY_OUTPUT}"
           echo "Artifact name requested for upload: ${EXPECTED_ARTIFACT_NAME}"
 
-      - name: Print top-level output files
+      - name: "15 always list top-level result files"
         if: ${{ always() }}
         shell: bash
         run: |
@@ -376,16 +485,41 @@ jobs:
           echo "Top-level files currently present in ${RESULT_DIR}:"
           find "${RESULT_DIR}" -maxdepth 1 -type f -printf "%f\n" | sort || true
 
-      - name: Save fitContinuous cache
+      - name: "16 failure/cancellation diagnostics: partial outputs"
+        if: ${{ failure() || cancelled() }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "Workflow reached failure/cancellation diagnostics."
+          echo "Result directory: ${RESULT_DIR}"
+          if [[ -d "${RESULT_DIR}" ]]; then
+            echo "Top-level result directory entries:"
+            find "${RESULT_DIR}" -maxdepth 1 -printf "%M %s %p\n" | sort || true
+            echo "Partial result files:"
+            find "${RESULT_DIR}" -maxdepth 2 -type f -printf "%s bytes  %p\n" | sort || true
+          else
+            echo "Result directory does not exist."
+          fi
+          echo "Fit cache directory: ${FIT_CACHE_DIR}"
+          if [[ -d "${FIT_CACHE_DIR}" ]]; then
+            echo "Fit cache directory entries:"
+            find "${FIT_CACHE_DIR}" -maxdepth 2 -printf "%M %s %p\n" | sort || true
+          else
+            echo "Fit cache directory does not exist."
+          fi
+
+      - name: "17 save fitContinuous cache (actions/cache/save@v5)"
         if: ${{ success() && inputs.use_fit_cache }}
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
+        continue-on-error: false
         with:
           path: ${{ env.FIT_CACHE_DIR }}
           key: ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: Upload stage results
+      - name: "18 upload stage results artifact (actions/upload-artifact@v7)"
         if: ${{ always() && inputs.upload_results }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
+        continue-on-error: false
         with:
           name: ${{ steps.stage.outputs.artifact_name }}
           path: |
@@ -394,8 +528,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Report completed stage
+      - name: "19 report completed stage"
         if: ${{ success() }}
+        continue-on-error: false
         shell: bash
         run: |
           set -euo pipefail
