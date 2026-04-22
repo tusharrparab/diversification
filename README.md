@@ -3,6 +3,10 @@
 This repository contains the Result Block 1 ancestral climatic reconstruction
 workflow for an avian macroevolution analysis.
 
+Result Block 1 estimates the ancestral climatic core of birds as the baseline
+for later frontier expansion and packing analyses. It is not a standalone PCA
+story.
+
 ## Biological Question
 
 Where did the radiation begin in climatic space?
@@ -69,6 +73,9 @@ Interpret the outputs in this order:
 2. Ancestral root estimates in original climate variables.
 3. Sensitivity and coherence diagnostics.
 4. PCA projection of the already reconstructed root.
+
+The PCA projection is a visualization and diagnostic layer for the
+original-variable root estimate. It is not the primary biological inference.
 
 ## Run
 
@@ -151,6 +158,11 @@ workflow trigger, with manual starts supported from the Actions tab, GitHub CLI,
 or REST API; GitHub also notes that the workflow file must exist on the default
 branch for manual dispatch to be available.
 
+Operationally, a committed workflow file and a completed workflow run are
+different things. A commit can make the run button available, but only a real
+manual dispatch creates a GitHub Actions run ID, logs, verified outputs, and an
+uploaded artifact.
+
 - [GitHub: manually running a workflow](https://docs.github.com/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 - [GitHub: `workflow_dispatch` event](https://docs.github.com/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
 
@@ -201,11 +213,31 @@ these required paths exist:
 - `data/raw/climate.csv`
 
 The workflow log also prints the selected stage, `GEIGER_NCORES`, fit-cache
-setting, exact input paths, result directory, cache directory, and whether a
+setting, exact input paths, result directory, cache directory, expected key
+output for the selected stage, all files verified for that stage, and whether a
 previous fit cache was restored or the run is starting cold.
 
-To confirm that `fitContinuous()` actually ran on real data, inspect the run log
-for the model-fit loop:
+Each run writes:
+
+```text
+results/result_block_1_strict_ancestral_climate/cloud_run_trace.txt
+```
+
+That trace records the workflow name, run ID, run attempt, stage, commit SHA,
+UTC timestamp, whether fit cache was requested, whether a cache restore was
+detected, the expected key output, and the artifact name.
+
+The workflow verifies these real script outputs by stage:
+
+| Stage | Files required by the workflow |
+| --- | --- |
+| `model_fit` | `per_variable_model_fit_attempts_detailed.csv`; `per_variable_model_selection_preliminary.csv` |
+| `root_reconstruction` | `per_variable_model_fits.csv`; `ancestral_root_original_climate_strict.csv`; `sensitivity_comparison_summary.csv`; `cross_variable_climate_coherence_diagnostics.csv`; `ancestral_root_vector_used_for_PCA_projection_strict.csv` |
+| `pca_projection` | `ancestral_root_projected_PCA_point_strict.csv`; `ancestral_root_projected_PCA_ellipses_strict.csv`; `ancestral_root_interpretability_metrics.csv`; `biological_interpretation_summary.txt`; `result_block_1_strict_ancestral_climate_outputs.xlsx` |
+| `plot` | `ancestral_root_projected_PCA_strict_plot.png`; `ancestral_root_projected_PCA_strict_plot.pdf` |
+
+To confirm that `fitContinuous()` actually ran on real data, inspect a real
+workflow run log for the model-fit loop:
 
 - `Fitting or loading per-variable geiger::fitContinuous model fits.`
 - `fitting all candidate models for <variable>`
@@ -216,10 +248,14 @@ If the workflow restored previous fits, the log instead reports
 the fit cache rather than refitting that variable from scratch.
 
 For a `model_fit`-only run, the stage completion proof is the uploaded artifact
-containing non-empty:
+for that GitHub Actions run containing non-empty:
 
 - `per_variable_model_fit_attempts_detailed.csv`
 - `per_variable_model_selection_preliminary.csv`
+
+The verifier fails the run if either file is missing or empty. The first file is
+the detailed per-model attempt table; the second is written only when the
+`model_fit` stage reaches its intended stopping point.
 
 `per_variable_model_fits.csv` is produced by the next stage,
 `root_reconstruction`, after the cached/raw model fits are assembled with the
@@ -235,12 +271,14 @@ Each cloud run uploads a stage-specific artifact, for example:
 
 After cloud runs, inspect the biological outputs first:
 
-- `per_variable_model_fits.csv`
+- `per_variable_model_fits.csv` if the run reached `root_reconstruction` or a
+  later stage
 - `ancestral_root_original_climate_strict.csv`
 - `biological_interpretation_summary.txt`
 
 Then inspect the PCA outputs as visualization and diagnostic products. They are
-not the primary inferential basis.
+not the primary inferential basis and should not be framed as an independent PCA
+result.
 
 ## Key Outputs
 
@@ -252,8 +290,10 @@ results/result_block_1_strict_ancestral_climate/
 
 Primary audit files:
 
+- `cloud_run_trace.txt`
 - `per_variable_model_fits.csv`
 - `per_variable_model_fit_attempts_detailed.csv`
+- `per_variable_model_selection_preliminary.csv`
 - `ancestral_root_original_climate_strict.csv`
 - `sensitivity_comparison_summary.csv`
 - `cross_variable_climate_coherence_diagnostics.csv`
