@@ -304,6 +304,9 @@ precip_vars <- c(
 )
 
 candidate_models <- c("BM", "OU", "EB", "lambda", "delta", "mean_trend")
+named_model_sets <- list(
+  "5models_no_OU" = setdiff(candidate_models, "OU")
+)
 primary_models <- c("BM", "lambda", "delta")
 sensitivity_models <- setdiff(candidate_models, primary_models)
 
@@ -319,24 +322,36 @@ if (!identical(model_fit_variable, "all")) {
   }
 }
 
+model_fit_model_is_named_set <- model_fit_model %in% names(named_model_sets)
+
 if (!identical(model_fit_model, "all")) {
   if (!identical(pipeline_stage, "model_fit")) {
     stop("--model-fit-model / MODEL_FIT_MODEL can only be used with --stage=model_fit")
   }
-  if (identical(model_fit_variable, "all")) {
-    stop("--model-fit-model requires --model-fit-variable to name one climate variable, not 'all'")
+  if (identical(model_fit_variable, "all") && !model_fit_model_is_named_set) {
+    stop("--model-fit-model requires --model-fit-variable to name one climate variable, unless an explicit named model set is requested")
   }
-  if (!model_fit_model %in% candidate_models) {
+  if (!model_fit_model %in% c(candidate_models, names(named_model_sets))) {
     stop(
       "Unknown model-fit model: ", model_fit_model,
-      ". Expected one of: all, ", paste(candidate_models, collapse = ", ")
+      ". Expected one of: all, ", paste(c(candidate_models, names(named_model_sets)), collapse = ", ")
     )
   }
 }
 
 model_fit_variables <- if (identical(model_fit_variable, "all")) climate_vars else model_fit_variable
-model_fit_models <- if (identical(model_fit_model, "all")) candidate_models else model_fit_model
+model_fit_models <- if (identical(model_fit_model, "all")) {
+  candidate_models
+} else if (model_fit_model_is_named_set) {
+  named_model_sets[[model_fit_model]]
+} else {
+  model_fit_model
+}
+model_fit_is_named_set_aggregation <- identical(pipeline_stage, "model_fit") &&
+  identical(model_fit_variable, "all") &&
+  model_fit_model_is_named_set
 model_fit_is_shard <- identical(pipeline_stage, "model_fit") &&
+  !model_fit_is_named_set_aggregation &&
   (!identical(model_fit_variable, "all") || !identical(model_fit_model, "all"))
 
 # -----------------------------
@@ -564,6 +579,273 @@ summarize_model_selection <- function(model_fit_table) {
       )
     }) %>%
     ungroup()
+}
+
+variable_type_for <- function(variable) {
+  case_when(
+    variable %in% thermal_vars ~ "thermal",
+    variable %in% precip_vars ~ "precipitation",
+    TRUE ~ "other"
+  )
+}
+
+model_process_interpretation <- function(model) {
+  case_when(
+    model == "BM" ~ "neutral drift baseline",
+    model == "EB" ~ "early rapid climatic change",
+    model == "lambda" ~ "strong phylogenetic structure / signal",
+    model == "delta" ~ "temporal shift in rate concentration",
+    model == "mean_trend" ~ "directional change",
+    model == "OU" ~ "OU excluded/deferred in this five-model comparison",
+    TRUE ~ "unclassified"
+  )
+}
+
+ensure_model_set_complete <- function(model_fit_table, variables, models, label) {
+  expected <- as_tibble(expand.grid(
+    variable = variables,
+    model = models,
+    stringsAsFactors = FALSE
+  ))
+
+  observed <- model_fit_table %>%
+    distinct(variable, model)
+
+  missing_rows <- expected %>%
+    anti_join(observed, by = c("variable", "model"))
+
+  if (nrow(missing_rows) > 0) {
+    preview <- missing_rows %>%
+      mutate(shard = paste0(.data$variable, "/", .data$model)) %>%
+      pull(shard)
+    stop(
+      "Cannot aggregate ", label, " because required cached model-fit shards are missing: ",
+      paste(head(preview, 20), collapse = ", "),
+      if (length(preview) > 20) " ..." else ""
+    )
+  }
+}
+
+build_model_comparison_table <- function(model_fit_table, model_selection, model_set_label) {
+  ranked <- model_fit_table %>%
+    filter(is.finite(.data$AICc)) %>%
+    arrange(.data$variable, .data$AICc, .data$model) %>%
+    group_by(.data$variable) %>%
+    mutate(aicc_rank = row_number()) %>%
+    ungroup()
+
+  second_best <- ranked %>%
+    filter(.data$aicc_rank == 2) %>%
+    transmute(
+      variable,
+      second_best_model = .data$model,
+      second_best_AICc = .data$AICc
+    )
+
+  best_parameters <- ranked %>%
+    filter(.data$aicc_rank == 1) %>%
+    transmute(
+      variable,
+      best_model_parameter_summary = .data$parameter_summary,
+      best_model_fit_warning = .data$fit_warning,
+      best_model_fit_error = .data$fit_error
+    )
+
+  model_selection %>%
+    left_join(second_best, by = "variable") %>%
+    left_join(best_parameters, by = "variable") %>%
+    mutate(
+      model_set = model_set_label,
+      OU_status = "excluded_deferred",
+      variable_type = variable_type_for(.data$variable),
+      delta_AICc_to_second_best = .data$second_best_AICc - .data$best_overall_AICc,
+      winner_support = case_when(
+        is.na(.data$best_overall_model) ~ "no_finite_winner",
+        is.na(.data$delta_AICc_to_second_best) ~ "no_second_finite_model",
+        .data$delta_AICc_to_second_best >= 4 ~ "robust",
+        .data$delta_AICc_to_second_best >= 2 ~ "moderate",
+        TRUE ~ "weak"
+      ),
+      biological_mode_interpretation = model_process_interpretation(.data$best_overall_model),
+      caution_flag = case_when(
+        is.na(.data$best_overall_model) ~ "no_finite_AICc_winner",
+        .data$winner_support == "weak" ~ "weak_AICc_separation",
+        .data$best_overall_model %in% setdiff(sensitivity_models, "OU") ~ "best_model_is_sensitivity_only_for_root_reconstruction",
+        TRUE ~ "none"
+      )
+    ) %>%
+    select(
+      variable,
+      variable_type,
+      model_set,
+      OU_status,
+      best_overall_model,
+      biological_mode_interpretation,
+      best_overall_AICc,
+      second_best_model,
+      second_best_AICc,
+      delta_AICc_to_second_best,
+      winner_support,
+      primary_model,
+      primary_AICc,
+      primary_delta_from_best,
+      best_model_parameter_summary,
+      best_model_fit_warning,
+      best_model_fit_error,
+      caution_flag
+    )
+}
+
+build_grouped_model_summary <- function(model_comparison) {
+  model_comparison %>%
+    count(.data$variable_type, .data$best_overall_model, .data$biological_mode_interpretation, name = "n_variables") %>%
+    left_join(
+      model_comparison %>%
+        group_by(.data$variable_type, .data$best_overall_model) %>%
+        summarise(
+          variables = paste(.data$variable, collapse = ", "),
+          robust_or_moderate_variables = sum(.data$winner_support %in% c("robust", "moderate"), na.rm = TRUE),
+          weak_variables = sum(.data$winner_support == "weak", na.rm = TRUE),
+          .groups = "drop"
+        ),
+      by = c("variable_type", "best_overall_model")
+    ) %>%
+    arrange(.data$variable_type, desc(.data$n_variables), .data$best_overall_model)
+}
+
+build_five_model_progress_tracker <- function(model_fit_table, models) {
+  expected <- as_tibble(expand.grid(
+    variable = climate_vars,
+    model = models,
+    stringsAsFactors = FALSE
+  ))
+
+  rows <- model_fit_table %>%
+    select(variable, model, fit_status, AICc, fit_warning, fit_error)
+
+  expected %>%
+    left_join(rows, by = c("variable", "model")) %>%
+    mutate(
+      dispatch_status = if_else(!is.na(.data$fit_status), "completed_or_loaded_from_fitContinuous_cache", "missing_from_fitContinuous_cache"),
+      workflow_run_id = NA_character_,
+      final_status = case_when(
+        !is.na(.data$fit_status) & is.finite(.data$AICc) ~ "available_with_finite_AICc",
+        !is.na(.data$fit_status) ~ "available_without_finite_AICc",
+        TRUE ~ "missing"
+      ),
+      fitting_evidence = case_when(
+        !is.na(.data$fit_status) ~ "cache row available in final aggregation; shard run ID is tracked in GitHub Actions artifacts/logs",
+        TRUE ~ "no cache row found"
+      ),
+      artifact_uploaded = NA,
+      cache_progress_saved = file.exists(cache_path_for_variable(.data$variable)),
+      notes = "workflow_run_id and artifact_uploaded are external GitHub orchestration fields, not stored inside per-variable fitContinuous cache"
+    ) %>%
+    select(
+      variable,
+      model,
+      dispatch_status,
+      workflow_run_id,
+      final_status,
+      fitting_evidence,
+      artifact_uploaded,
+      cache_progress_saved,
+      fit_status,
+      AICc,
+      fit_warning,
+      fit_error,
+      notes
+    )
+}
+
+write_five_model_interpretation_summary <- function(path, model_comparison, grouped_summary, model_set_label) {
+  model_counts <- model_comparison %>%
+    count(.data$best_overall_model, name = "n") %>%
+    arrange(match(.data$best_overall_model, named_model_sets[[model_set_label]]))
+
+  count_line <- function(model) {
+    n <- model_counts$n[match(model, model_counts$best_overall_model)]
+    if (is.na(n)) n <- 0
+    paste0(model, ": ", n)
+  }
+
+  dominant <- model_counts %>%
+    filter(!is.na(.data$best_overall_model)) %>%
+    arrange(desc(.data$n), .data$best_overall_model) %>%
+    slice(1)
+
+  dominant_line <- if (nrow(dominant) == 1) {
+    paste0(
+      "Dominant best-fit mode in this five-model comparison: ",
+      dominant$best_overall_model,
+      " (", model_process_interpretation(dominant$best_overall_model), ")."
+    )
+  } else {
+    "Dominant best-fit mode in this five-model comparison: unavailable."
+  }
+
+  group_lines <- grouped_summary %>%
+    mutate(line = paste0(
+      variable_type, " / ", best_overall_model, ": ", n_variables,
+      " variable(s); ", variables
+    )) %>%
+    pull(line)
+
+  parameter_lines <- model_comparison %>%
+    filter(.data$best_overall_model %in% c("lambda", "delta", "mean_trend")) %>%
+    transmute(line = paste0(
+      variable,
+      " winner=",
+      best_overall_model,
+      "; parameters: ",
+      if_else(is.na(.data$best_model_parameter_summary), "not reported", .data$best_model_parameter_summary)
+    )) %>%
+    pull(line)
+
+  caution_lines <- model_comparison %>%
+    filter(.data$caution_flag != "none") %>%
+    transmute(line = paste0(variable, ": ", caution_flag)) %>%
+    pull(line)
+
+  lines <- c(
+    "Five-model no-OU model-fit interpretation summary",
+    "=================================================",
+    "",
+    "Scope:",
+    "This summary compares BM, EB, lambda, delta, and mean_trend fits for Result Block 1.",
+    "OU was explicitly excluded/deferred from this aggregation because OU shards exceeded the hosted-runner execution limit.",
+    "This is not the final six-model universe and should be labeled as a five-model/no-OU comparison.",
+    "",
+    "Biological model meanings:",
+    "BM = neutral drift baseline.",
+    "EB = early rapid climatic change.",
+    "lambda = strong phylogenetic structure / signal.",
+    "delta = temporal shift in rate concentration.",
+    "mean_trend = directional change.",
+    "",
+    "Best-model counts:",
+    count_line("BM"),
+    count_line("EB"),
+    count_line("lambda"),
+    count_line("delta"),
+    count_line("mean_trend"),
+    "",
+    dominant_line,
+    "",
+    "Grouped summary by climate-variable type:",
+    if (length(group_lines) == 0) "none" else group_lines,
+    "",
+    "Parameter notes for lambda/delta/mean_trend winners:",
+    if (length(parameter_lines) == 0) "none" else parameter_lines,
+    "",
+    "Caution flags:",
+    if (length(caution_lines) == 0) "none" else caution_lines,
+    "",
+    "Interpretation rule:",
+    "Treat weak AICc separations as suggestive rather than decisive, and do not over-interpret noisy transform or trend estimates."
+  )
+
+  writeLines(lines, path)
 }
 
 # -----------------------------
@@ -1604,6 +1886,104 @@ if (model_fit_is_shard) {
   )
   writeLines(completion_lines, file.path(output_dir, "model_fit_shard_completion.txt"))
   message("Stage model_fit shard complete. Stopping before full model-fit aggregation.")
+  quit(save = "no", status = 0)
+}
+
+if (model_fit_is_named_set_aggregation) {
+  model_set_label <- model_fit_model
+  output_suffix <- model_set_label
+
+  ensure_model_set_complete(
+    model_fit_attempts,
+    variables = climate_vars,
+    models = model_fit_models,
+    label = model_set_label
+  )
+
+  write_csv(
+    model_fit_attempts,
+    file.path(output_dir, paste0("per_variable_model_fit_attempts_", output_suffix, ".csv"))
+  )
+
+  if (any(!is.finite(model_fit_attempts$AICc))) {
+    failed_fit_count <- sum(!is.finite(model_fit_attempts$AICc))
+    add_pipeline_warning(paste0(
+      failed_fit_count,
+      " five-model/no-OU model fits did not return finite AICc; see per_variable_model_fit_attempts_",
+      output_suffix,
+      ".csv."
+    ))
+  }
+
+  model_selection <- summarize_model_selection(model_fit_attempts)
+  if (any(is.na(model_selection$best_overall_model))) {
+    stop(
+      "At least one variable has no finite AICc model fit in the five-model/no-OU aggregation: ",
+      paste(model_selection$variable[is.na(model_selection$best_overall_model)], collapse = ", ")
+    )
+  }
+  if (any(is.na(model_selection$primary_model))) {
+    stop(
+      "At least one variable has no finite primary model fit among BM/lambda/delta in the five-model/no-OU aggregation: ",
+      paste(model_selection$variable[is.na(model_selection$primary_model)], collapse = ", ")
+    )
+  }
+
+  model_comparison <- build_model_comparison_table(
+    model_fit_attempts,
+    model_selection,
+    model_set_label = model_set_label
+  )
+  grouped_summary <- build_grouped_model_summary(model_comparison)
+  progress_tracker <- build_five_model_progress_tracker(model_fit_attempts, model_fit_models)
+
+  write_csv(
+    model_selection,
+    file.path(output_dir, paste0("per_variable_model_selection_", output_suffix, ".csv"))
+  )
+  write_csv(
+    model_comparison,
+    file.path(output_dir, paste0("per_variable_model_comparison_", output_suffix, ".csv"))
+  )
+  write_csv(
+    grouped_summary,
+    file.path(output_dir, paste0("grouped_model_summary_", output_suffix, ".csv"))
+  )
+  write_csv(
+    progress_tracker,
+    file.path(output_dir, "five_model_no_OU_progress_tracker.csv")
+  )
+
+  writeLines(
+    c(
+      "stage=model_fit",
+      "mode=final_named_model_set_aggregation",
+      paste0("model_set=", model_set_label),
+      "OU_status=excluded_deferred",
+      paste0("models_included=", paste(model_fit_models, collapse = ",")),
+      paste0("variables_included=", paste(model_fit_variables, collapse = ",")),
+      paste0("attempt_rows=", nrow(model_fit_attempts)),
+      paste0("completed_at_utc=", format(Sys.time(), tz = "UTC", usetz = TRUE)),
+      "scientific_note=This aggregation changes only model-set inclusion for operational readiness; it does not change geiger fitting logic or primary reconstruction design."
+    ),
+    file.path(output_dir, paste0("model_fit_metadata_", output_suffix, ".txt"))
+  )
+
+  write_five_model_interpretation_summary(
+    file.path(output_dir, paste0("biological_interpretation_summary_", output_suffix, ".txt")),
+    model_comparison,
+    grouped_summary,
+    model_set_label = model_set_label
+  )
+
+  if (save_intermediate_rds) {
+    saveRDS(
+      fit_cache_objects,
+      file.path(cache_dir, paste0("all_fitContinuous_cache_objects_", output_suffix, ".rds"))
+    )
+  }
+
+  message("Stage model_fit five-model/no-OU aggregation complete. Stopping before root reconstruction.")
   quit(save = "no", status = 0)
 }
 

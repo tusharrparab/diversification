@@ -56,12 +56,13 @@ on:
           - temperature_annual_range
           - temperature_seasonality
       model_fit_model:
-        description: "For stage=model_fit only: fit one candidate model for the selected variable, or all candidate models."
+        description: "For stage=model_fit only: fit one candidate model, all candidate models, or aggregate the explicit five-model/no-OU set."
         required: true
         default: "all"
         type: choice
         options:
           - all
+          - 5models_no_OU
           - BM
           - OU
           - EB
@@ -90,6 +91,10 @@ env:
   RESULT_DIR: results/result_block_1_strict_ancestral_climate
   FIT_CACHE_DIR: results/result_block_1_strict_ancestral_climate/cache
   FIT_CACHE_NAMESPACE: ancestral-fit-cache
+  # Compatibility fallback for caches produced before five-model/no-OU aggregation
+  # support was added. This keeps already completed shards usable after the
+  # aggregation-only patch changes the script hash.
+  FIT_CACHE_LEGACY_HASH: 7c17d957fe289ce981c6cf1f11e54ab727f1970c33bba925486906807832bebe
 
 jobs:
   run-ancestral-climate:
@@ -181,14 +186,27 @@ jobs:
             exit 1
           fi
 
-          if [[ "${MODEL_FIT_MODEL}" != "all" && "${MODEL_FIT_VARIABLE}" == "all" ]]; then
+          if [[ "${MODEL_FIT_MODEL}" != "all" && "${MODEL_FIT_MODEL}" != "5models_no_OU" && "${MODEL_FIT_VARIABLE}" == "all" ]]; then
             echo "::error::model_fit_model=${MODEL_FIT_MODEL} requires model_fit_variable to name one climate variable, not 'all'."
             exit 1
           fi
 
           case "${STAGE}" in
             model_fit)
-              if [[ "${MODEL_FIT_VARIABLE}" != "all" || "${MODEL_FIT_MODEL}" != "all" ]]; then
+              if [[ "${MODEL_FIT_VARIABLE}" == "all" && "${MODEL_FIT_MODEL}" == "5models_no_OU" ]]; then
+                key_output="${RESULT_DIR}/per_variable_model_selection_5models_no_OU.csv"
+                stage_note="model_fit final aggregation over BM, EB, lambda, delta, and mean_trend only; OU is explicitly excluded/deferred."
+                required_outputs=(
+                  "${RESULT_DIR}/per_variable_model_fit_attempts_5models_no_OU.csv"
+                  "${RESULT_DIR}/per_variable_model_selection_5models_no_OU.csv"
+                  "${RESULT_DIR}/per_variable_model_comparison_5models_no_OU.csv"
+                  "${RESULT_DIR}/grouped_model_summary_5models_no_OU.csv"
+                  "${RESULT_DIR}/five_model_no_OU_progress_tracker.csv"
+                  "${RESULT_DIR}/model_fit_metadata_5models_no_OU.txt"
+                  "${RESULT_DIR}/biological_interpretation_summary_5models_no_OU.txt"
+                )
+                artifact_name="ancestral-climate-model-fit-5models-no-OU"
+              elif [[ "${MODEL_FIT_VARIABLE}" != "all" || "${MODEL_FIT_MODEL}" != "all" ]]; then
                 key_output="${RESULT_DIR}/model_fit_shard_completion.txt"
                 stage_note="model_fit shard fits or loads a bounded variable/model subset so GitHub's 6-hour job cap cannot be mistaken for completed full model fitting."
                 required_outputs=(
@@ -408,6 +426,7 @@ jobs:
           key: ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ hashFiles('scripts/run_ancestral_climate_reconstruction.R', 'data/raw/pruned_phylogeny.nex', 'data/raw/climate.csv') }}-
+            ${{ env.FIT_CACHE_NAMESPACE }}-${{ runner.os }}-${{ env.FIT_CACHE_LEGACY_HASH }}-
 
       - name: "10 diagnostics: fit cache restore result"
         if: ${{ always() }}

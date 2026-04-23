@@ -232,6 +232,12 @@ variable/model shards have completed, run `model_fit` again with
 `model_fit_variable=all` and `model_fit_model=all`. That final cached aggregation
 loads the saved fits and writes the canonical model-fit proof files.
 
+When OU is intentionally deferred because it exceeds the hosted-runner limit,
+run only the five non-OU shards (`BM`, `EB`, `lambda`, `delta`, `mean_trend`)
+and aggregate them with `model_fit_variable=all` and
+`model_fit_model=5models_no_OU`. This is an explicitly labeled five-model
+comparison, not the final six-model universe.
+
 Before installing R packages or starting model runtime, the workflow checks that
 these required paths exist:
 
@@ -265,6 +271,7 @@ The workflow verifies these real script outputs by stage:
 | Stage | Files required by the workflow |
 | --- | --- |
 | `model_fit` final aggregation (`model_fit_variable=all`, `model_fit_model=all`) | `per_variable_model_fit_attempts_detailed.csv`; `per_variable_model_selection_preliminary.csv` |
+| `model_fit` five-model aggregation (`model_fit_variable=all`, `model_fit_model=5models_no_OU`) | `per_variable_model_fit_attempts_5models_no_OU.csv`; `per_variable_model_selection_5models_no_OU.csv`; `per_variable_model_comparison_5models_no_OU.csv`; `grouped_model_summary_5models_no_OU.csv`; `five_model_no_OU_progress_tracker.csv`; `model_fit_metadata_5models_no_OU.txt`; `biological_interpretation_summary_5models_no_OU.txt` |
 | `model_fit` shard | `model_fit_shard_attempts.csv`; `model_fit_shard_completion.txt`; the relevant `cache/*_fitContinuous_cache.rds` file; `model_fit_shard_selection.csv` when all candidate models for a variable were requested |
 | `root_reconstruction` | `per_variable_model_fits.csv`; `ancestral_root_original_climate_strict.csv`; `sensitivity_comparison_summary.csv`; `cross_variable_climate_coherence_diagnostics.csv`; `ancestral_root_vector_used_for_PCA_projection_strict.csv` |
 | `pca_projection` | `ancestral_root_projected_PCA_point_strict.csv`; `ancestral_root_projected_PCA_ellipses_strict.csv`; `ancestral_root_interpretability_metrics.csv`; `biological_interpretation_summary.txt`; `result_block_1_strict_ancestral_climate_outputs.xlsx` |
@@ -293,6 +300,12 @@ uploaded artifact for that GitHub Actions run containing non-empty:
 The verifier fails the run if either file is missing or empty. The first file is
 the detailed per-model attempt table; the second is written only when the
 `model_fit` stage reaches its intended stopping point.
+
+For the explicit five-model/no-OU aggregation, the proof files are the suffixed
+`*_5models_no_OU.*` outputs listed above, especially the attempts table, model
+selection table, per-variable comparison table, grouped model summary, and
+biological interpretation summary. These outputs must be read as a BM/EB/lambda/
+delta/mean_trend comparison with OU excluded/deferred.
 
 For a shard run, proof is different: the run must verify
 `model_fit_shard_completion.txt`, `model_fit_shard_attempts.csv`, and the
