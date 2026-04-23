@@ -34,8 +34,40 @@ on:
       ncores:
         description: "Number of cores to expose to geiger::fitContinuous via GEIGER_NCORES."
         required: true
-        default: "4"
+        default: "1"
         type: string
+      model_fit_variable:
+        description: "For stage=model_fit only: shard the fit stage to one variable, or use all for the final cached aggregation."
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - annual_mean_temperature
+          - annual_precipitation
+          - maximum_temperature_warmest_month
+          - mean_temperature_coldest_quarter
+          - mean_temperature_driest_quarter
+          - minimum_temperature_coldest_month
+          - precipitation_in_coldest_quarter
+          - precipitation_of_coldest_quarter
+          - precipitation_of_wettest_quarter
+          - precipitation_wettest_month
+          - temperature_annual_range
+          - temperature_seasonality
+      model_fit_model:
+        description: "For stage=model_fit only: fit one candidate model for the selected variable, or all candidate models."
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - BM
+          - OU
+          - EB
+          - lambda
+          - delta
+          - mean_trend
       use_fit_cache:
         description: "Restore/save the pipeline fitContinuous cache between cloud runs."
         required: true
@@ -135,17 +167,51 @@ jobs:
         shell: bash
         env:
           STAGE: ${{ inputs.stage }}
+          MODEL_FIT_VARIABLE: ${{ inputs.model_fit_variable }}
+          MODEL_FIT_MODEL: ${{ inputs.model_fit_model }}
         run: |
           set -euo pipefail
 
+          safe_component() {
+            printf "%s" "$1" | sed -E 's/[^A-Za-z0-9_]+/_/g; s/_+/_/g; s/^_//; s/_$//'
+          }
+
+          if [[ "${STAGE}" != "model_fit" && ( "${MODEL_FIT_VARIABLE}" != "all" || "${MODEL_FIT_MODEL}" != "all" ) ]]; then
+            echo "::error::model_fit_variable/model_fit_model can only be used when stage=model_fit."
+            exit 1
+          fi
+
+          if [[ "${MODEL_FIT_MODEL}" != "all" && "${MODEL_FIT_VARIABLE}" == "all" ]]; then
+            echo "::error::model_fit_model=${MODEL_FIT_MODEL} requires model_fit_variable to name one climate variable, not 'all'."
+            exit 1
+          fi
+
           case "${STAGE}" in
             model_fit)
-              key_output="${RESULT_DIR}/per_variable_model_selection_preliminary.csv"
-              stage_note="model_fit intentionally stops before root reconstruction; per_variable_model_fits.csv is not expected yet."
-              required_outputs=(
-                "${RESULT_DIR}/per_variable_model_fit_attempts_detailed.csv"
-                "${RESULT_DIR}/per_variable_model_selection_preliminary.csv"
-              )
+              if [[ "${MODEL_FIT_VARIABLE}" != "all" || "${MODEL_FIT_MODEL}" != "all" ]]; then
+                key_output="${RESULT_DIR}/model_fit_shard_completion.txt"
+                stage_note="model_fit shard fits or loads a bounded variable/model subset so GitHub's 6-hour job cap cannot be mistaken for completed full model fitting."
+                required_outputs=(
+                  "${RESULT_DIR}/model_fit_shard_attempts.csv"
+                  "${RESULT_DIR}/model_fit_shard_completion.txt"
+                )
+                if [[ "${MODEL_FIT_VARIABLE}" != "all" ]]; then
+                  safe_variable="$(safe_component "${MODEL_FIT_VARIABLE}")"
+                  required_outputs+=("${FIT_CACHE_DIR}/${safe_variable}_fitContinuous_cache.rds")
+                fi
+                if [[ "${MODEL_FIT_MODEL}" == "all" ]]; then
+                  required_outputs+=("${RESULT_DIR}/model_fit_shard_selection.csv")
+                fi
+                artifact_name="ancestral-climate-model-fit-shard-$(safe_component "${MODEL_FIT_VARIABLE}")-$(safe_component "${MODEL_FIT_MODEL}")"
+              else
+                key_output="${RESULT_DIR}/per_variable_model_selection_preliminary.csv"
+                stage_note="model_fit final aggregation intentionally stops before root reconstruction; per_variable_model_fits.csv is not expected yet."
+                required_outputs=(
+                  "${RESULT_DIR}/per_variable_model_fit_attempts_detailed.csv"
+                  "${RESULT_DIR}/per_variable_model_selection_preliminary.csv"
+                )
+                artifact_name="ancestral-climate-model-fit"
+              fi
               ;;
             root_reconstruction)
               key_output="${RESULT_DIR}/ancestral_root_original_climate_strict.csv"
@@ -183,7 +249,7 @@ jobs:
               ;;
           esac
 
-          artifact_name="ancestral-climate-${STAGE//_/-}"
+          artifact_name="${artifact_name:-ancestral-climate-${STAGE//_/-}}"
 
           echo "key_output=${key_output}" >> "${GITHUB_OUTPUT}"
           echo "required_outputs=${required_outputs[*]}" >> "${GITHUB_OUTPUT}"
@@ -205,6 +271,8 @@ jobs:
           echo "Required production stage order: model_fit -> root_reconstruction -> pca_projection -> plot"
           echo "Selected stage: ${{ inputs.stage }}"
           echo "GEIGER_NCORES: ${{ inputs.ncores }}"
+          echo "Model-fit variable shard: ${{ inputs.model_fit_variable }}"
+          echo "Model-fit candidate-model shard: ${{ inputs.model_fit_model }}"
           echo "Fit cache restore/save enabled: ${{ inputs.use_fit_cache }}"
           echo "Upload results: ${{ inputs.upload_results }}"
           echo "Scientific script: ${SCRIPT_FILE}"
@@ -378,6 +446,8 @@ jobs:
             echo "workflow_run_id=${GITHUB_RUN_ID}"
             echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT}"
             echo "stage=${{ inputs.stage }}"
+            echo "model_fit_variable=${{ inputs.model_fit_variable }}"
+            echo "model_fit_model=${{ inputs.model_fit_model }}"
             echo "commit_sha=${GITHUB_SHA}"
             echo "git_ref=${GITHUB_REF}"
             date -u +"started_at_utc=%Y-%m-%dT%H:%M:%SZ"
@@ -421,6 +491,8 @@ jobs:
           RESUME_MODEL_CACHE: ${{ inputs.use_fit_cache }}
           SAVE_INTERMEDIATE_RDS: "true"
           OUTPUT_DIR: ${{ env.RESULT_DIR }}
+          MODEL_FIT_VARIABLE: ${{ inputs.model_fit_variable }}
+          MODEL_FIT_MODEL: ${{ inputs.model_fit_model }}
         run: |
           set -euo pipefail
 
@@ -433,6 +505,8 @@ jobs:
           echo "Expected key output after R returns: ${EXPECTED_KEY_OUTPUT}"
           Rscript "${SCRIPT_FILE}" \
             --stage="${{ inputs.stage }}" \
+            --model-fit-variable="${{ inputs.model_fit_variable }}" \
+            --model-fit-model="${{ inputs.model_fit_model }}" \
             "${cache_args[@]}"
 
       - name: "14 verify selected stage outputs"

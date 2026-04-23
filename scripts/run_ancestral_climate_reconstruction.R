@@ -106,6 +106,8 @@ resume_model_cache <- truthy(Sys.getenv("RESUME_MODEL_CACHE", "true")) &&
   !has_cli_flag(args, "no-resume-model-cache")
 save_intermediate_rds <- truthy(Sys.getenv("SAVE_INTERMEDIATE_RDS", "false")) ||
   has_cli_flag(args, "save-intermediate-rds")
+model_fit_variable <- str_trim(get_cli_value(args, "model-fit-variable", Sys.getenv("MODEL_FIT_VARIABLE", "all")))
+model_fit_model <- str_trim(get_cli_value(args, "model-fit-model", Sys.getenv("MODEL_FIT_MODEL", "all")))
 
 min_valid_values <- suppressWarnings(as.integer(Sys.getenv("MIN_VALID_VALUES", "10")))
 if (is.na(min_valid_values) || min_valid_values < 3) min_valid_values <- 10
@@ -305,6 +307,38 @@ candidate_models <- c("BM", "OU", "EB", "lambda", "delta", "mean_trend")
 primary_models <- c("BM", "lambda", "delta")
 sensitivity_models <- setdiff(candidate_models, primary_models)
 
+if (!identical(model_fit_variable, "all")) {
+  if (!identical(pipeline_stage, "model_fit")) {
+    stop("--model-fit-variable / MODEL_FIT_VARIABLE can only be used with --stage=model_fit")
+  }
+  if (!model_fit_variable %in% climate_vars) {
+    stop(
+      "Unknown model-fit variable: ", model_fit_variable,
+      ". Expected one of: all, ", paste(climate_vars, collapse = ", ")
+    )
+  }
+}
+
+if (!identical(model_fit_model, "all")) {
+  if (!identical(pipeline_stage, "model_fit")) {
+    stop("--model-fit-model / MODEL_FIT_MODEL can only be used with --stage=model_fit")
+  }
+  if (identical(model_fit_variable, "all")) {
+    stop("--model-fit-model requires --model-fit-variable to name one climate variable, not 'all'")
+  }
+  if (!model_fit_model %in% candidate_models) {
+    stop(
+      "Unknown model-fit model: ", model_fit_model,
+      ". Expected one of: all, ", paste(candidate_models, collapse = ", ")
+    )
+  }
+}
+
+model_fit_variables <- if (identical(model_fit_variable, "all")) climate_vars else model_fit_variable
+model_fit_models <- if (identical(model_fit_model, "all")) candidate_models else model_fit_model
+model_fit_is_shard <- identical(pipeline_stage, "model_fit") &&
+  (!identical(model_fit_variable, "all") || !identical(model_fit_model, "all"))
+
 # -----------------------------
 # Model fitting helpers
 # -----------------------------
@@ -433,38 +467,68 @@ validate_cached_fit <- function(cache_obj, variable, tree, trait) {
     is.list(cache_obj$fit_objects)
 }
 
-fit_models_for_variable <- function(tree, trait, variable) {
+fit_models_for_variable <- function(tree, trait, variable, models_to_fit = candidate_models) {
   cache_path <- cache_path_for_variable(variable)
+  fit_objects <- list()
+  fit_rows <- tibble()
+  cache_valid <- FALSE
 
   if (resume_model_cache && !force_refit_models && file.exists(cache_path)) {
     cache_obj <- readRDS(cache_path)
     if (validate_cached_fit(cache_obj, variable, tree, trait)) {
-      message("  using cached fitContinuous fits for ", variable)
-      return(cache_obj)
+      message("  using cached fitContinuous cache for ", variable)
+      fit_objects <- cache_obj$fit_objects
+      fit_rows <- cache_obj$model_rows
+      cache_valid <- TRUE
+    } else {
+      add_pipeline_warning(paste0("Ignoring stale or malformed model cache for ", variable))
     }
-    add_pipeline_warning(paste0("Ignoring stale or malformed model cache for ", variable))
   }
 
-  message("  fitting all candidate models for ", variable)
-  fit_objects <- list()
-  fit_rows <- list()
+  existing_models <- if ("model" %in% names(fit_rows)) unique(as.character(fit_rows$model)) else character()
 
-  for (m in candidate_models) {
+  if (length(models_to_fit) == length(candidate_models) && setequal(models_to_fit, candidate_models)) {
+    message("  fitting or loading all candidate models for ", variable)
+  } else {
+    message("  fitting or loading selected candidate models for ", variable, ": ", paste(models_to_fit, collapse = ", "))
+  }
+
+  for (m in models_to_fit) {
+    if (cache_valid && !force_refit_models && m %in% existing_models) {
+      message("    using cached fitContinuous fit for ", variable, " under ", m)
+      next
+    }
+
     message("    ", variable, " under ", m)
     fit_result <- fit_one_model(tree, trait, variable = variable, model = m)
     fit_objects[[m]] <- fit_result$fit
-    fit_rows[[length(fit_rows) + 1]] <- fit_result$row
+    if ("model" %in% names(fit_rows)) {
+      fit_rows <- fit_rows %>% filter(.data$model != m)
+    }
+    fit_rows <- bind_rows(fit_rows, fit_result$row) %>%
+      mutate(model = factor(.data$model, levels = candidate_models)) %>%
+      arrange(.data$model) %>%
+      mutate(model = as.character(.data$model))
+
+    out <- list(
+      variable = variable,
+      tip_labels = tree$tip.label,
+      trait_names = names(trait),
+      model_rows = fit_rows,
+      fit_objects = fit_objects
+    )
+    saveRDS(out, cache_path)
+    existing_models <- unique(as.character(fit_rows$model))
+    message("    saved fitContinuous cache for ", variable, " after ", m)
   }
 
-  out <- list(
+  list(
     variable = variable,
     tip_labels = tree$tip.label,
     trait_names = names(trait),
-    model_rows = bind_rows(fit_rows),
+    model_rows = fit_rows,
     fit_objects = fit_objects
   )
-  saveRDS(out, cache_path)
-  out
 }
 
 add_model_deltas <- function(model_fit_table) {
@@ -1499,17 +1563,50 @@ crown_node <- as.character(Ntip(tree_pruned) + 1)
 # Stage: model fitting
 # -----------------------------
 message("Fitting or loading per-variable geiger::fitContinuous model fits.")
+message("Model-fit variable scope: ", paste(model_fit_variables, collapse = ", "))
+message("Model-fit model scope: ", paste(model_fit_models, collapse = ", "))
 
 fit_cache_objects <- list()
-for (v in climate_vars) {
+for (v in model_fit_variables) {
   trait <- X[[v]]
   names(trait) <- rownames(X)
   trait <- trait[tree_pruned$tip.label]
-  fit_cache_objects[[v]] <- fit_models_for_variable(tree_pruned, trait, v)
+  fit_cache_objects[[v]] <- fit_models_for_variable(
+    tree_pruned,
+    trait,
+    v,
+    models_to_fit = model_fit_models
+  )
 }
 
 model_fit_attempts <- bind_rows(lapply(fit_cache_objects, `[[`, "model_rows")) %>%
   add_model_deltas()
+
+if (model_fit_is_shard) {
+  write_csv(model_fit_attempts, file.path(output_dir, "model_fit_shard_attempts.csv"))
+  if (setequal(model_fit_models, candidate_models)) {
+    write_csv(
+      summarize_model_selection(model_fit_attempts),
+      file.path(output_dir, "model_fit_shard_selection.csv")
+    )
+  }
+
+  completion_lines <- c(
+    "stage=model_fit",
+    "mode=shard",
+    paste0("model_fit_variable=", model_fit_variable),
+    paste0("model_fit_model=", model_fit_model),
+    paste0("variables_completed=", paste(model_fit_variables, collapse = ",")),
+    paste0("models_completed_or_loaded=", paste(model_fit_models, collapse = ",")),
+    paste0("cache_files=", paste(vapply(model_fit_variables, cache_path_for_variable, character(1)), collapse = ",")),
+    paste0("attempt_rows=", nrow(model_fit_attempts)),
+    paste0("completed_at_utc=", format(Sys.time(), tz = "UTC", usetz = TRUE))
+  )
+  writeLines(completion_lines, file.path(output_dir, "model_fit_shard_completion.txt"))
+  message("Stage model_fit shard complete. Stopping before full model-fit aggregation.")
+  quit(save = "no", status = 0)
+}
+
 write_csv(model_fit_attempts, file.path(output_dir, "per_variable_model_fit_attempts_detailed.csv"))
 
 if (any(!is.finite(model_fit_attempts$AICc))) {
