@@ -1,0 +1,13 @@
+variable,best_overall_model,best_overall_AICc,primary_model,primary_AICc,primary_delta_from_best
+annual_mean_temperature,lambda,103062.50982046373,lambda,103062.50982046373,0
+annual_precipitation,lambda,154604.51549351556,lambda,154604.51549351556,0
+maximum_temperature_warmest_month,lambda,97873.73466549734,lambda,97873.73466549734,0
+mean_temperature_coldest_quarter,lambda,111003.13512859587,lambda,111003.13512859587,0
+mean_temperature_driest_quarter,lambda,109498.0116501161,lambda,109498.0116501161,0
+minimum_temperature_coldest_month,lambda,112260.89457268709,lambda,112260.89457268709,0
+precipitation_in_coldest_quarter,lambda,135516.69840053283,lambda,135516.69840053283,0
+precipitation_of_coldest_quarter,lambda,135516.69840046566,lambda,135516.69840046566,0
+precipitation_of_wettest_quarter,lambda,136705.53718158937,lambda,136705.53718158937,0
+precipitation_wettest_month,lambda,116564.56155126123,lambda,116564.56155126123,0
+temperature_annual_range,lambda,110942.81219048033,lambda,110942.81219048033,0
+temperature_seasonality,lambda,176483.70772186446,lambda,176483.70772186446,0

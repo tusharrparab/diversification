@@ -108,6 +108,12 @@ save_intermediate_rds <- truthy(Sys.getenv("SAVE_INTERMEDIATE_RDS", "false")) ||
   has_cli_flag(args, "save-intermediate-rds")
 model_fit_variable <- str_trim(get_cli_value(args, "model-fit-variable", Sys.getenv("MODEL_FIT_VARIABLE", "all")))
 model_fit_model <- str_trim(get_cli_value(args, "model-fit-model", Sys.getenv("MODEL_FIT_MODEL", "all")))
+downstream_model_set <- str_trim(get_cli_value(args, "model-set", Sys.getenv("MODEL_SET", "standard")))
+downstream_model_set <- match.arg(
+  downstream_model_set,
+  choices = c("standard", "5models_no_OU")
+)
+using_named_downstream_model_set <- !identical(downstream_model_set, "standard")
 
 min_valid_values <- suppressWarnings(as.integer(Sys.getenv("MIN_VALID_VALUES", "10")))
 if (is.na(min_valid_values) || min_valid_values < 3) min_valid_values <- 10
@@ -163,6 +169,10 @@ safe_file_component <- function(x) {
     str_replace_all("[^A-Za-z0-9_]+", "_") |>
     str_replace_all("_+", "_") |>
     str_replace_all("^_|_$", "")
+}
+
+model_set_file_path <- function(stem, ext = "csv", model_set_label = downstream_model_set) {
+  file.path(output_dir, paste0(stem, "_", model_set_label, ".", ext))
 }
 
 collapse_flags <- function(x) {
@@ -258,6 +268,63 @@ ellipse_area <- function(cov_mat, level) {
   stats::qchisq(level, df = 2) * pi * sqrt(det(cov_mat))
 }
 
+read_required_csv <- function(path, label) {
+  if (!file.exists(path)) {
+    stop(label, " does not exist: ", path)
+  }
+  read_csv(path, show_col_types = FALSE)
+}
+
+read_required_lines <- function(path, label) {
+  if (!file.exists(path)) {
+    stop(label, " does not exist: ", path)
+  }
+  readLines(path, warn = FALSE)
+}
+
+extract_parameter_from_summary <- function(parameter_summary, parameter_name) {
+  if (!is.character(parameter_summary) || length(parameter_summary) == 0 || is.na(parameter_summary[1])) {
+    return(NA_real_)
+  }
+
+  pieces <- str_split(parameter_summary[1], ";\\s*")[[1]]
+  hit <- pieces[str_detect(pieces, paste0("^", parameter_name, "="))]
+  if (length(hit) == 0) {
+    return(NA_real_)
+  }
+
+  suppressWarnings(as.numeric(sub(paste0("^", parameter_name, "="), "", hit[1])))
+}
+
+load_named_downstream_model_set <- function(model_set_label) {
+  list(
+    fit_attempts = read_required_csv(
+      model_set_file_path("per_variable_model_fit_attempts", model_set_label = model_set_label),
+      paste0("Named model-fit attempts table for ", model_set_label)
+    ),
+    model_selection = read_required_csv(
+      model_set_file_path("per_variable_model_selection", model_set_label = model_set_label),
+      paste0("Named model-selection table for ", model_set_label)
+    ),
+    model_comparison = read_required_csv(
+      model_set_file_path("per_variable_model_comparison", model_set_label = model_set_label),
+      paste0("Named model-comparison table for ", model_set_label)
+    ),
+    grouped_summary = read_required_csv(
+      model_set_file_path("grouped_model_summary", model_set_label = model_set_label),
+      paste0("Named grouped model summary for ", model_set_label)
+    ),
+    metadata_lines = read_required_lines(
+      model_set_file_path("model_fit_metadata", ext = "txt", model_set_label = model_set_label),
+      paste0("Named model-fit metadata for ", model_set_label)
+    ),
+    biological_summary_lines = read_required_lines(
+      model_set_file_path("biological_interpretation_summary", ext = "txt", model_set_label = model_set_label),
+      paste0("Named biological interpretation summary for ", model_set_label)
+    )
+  )
+}
+
 classify_ratio_size <- function(ratio) {
   case_when(
     !is.finite(ratio) ~ "unknown",
@@ -306,6 +373,16 @@ precip_vars <- c(
 candidate_models <- c("BM", "OU", "EB", "lambda", "delta", "mean_trend")
 primary_models <- c("BM", "lambda", "delta")
 sensitivity_models <- setdiff(candidate_models, primary_models)
+named_downstream_model_sets <- list(
+  "5models_no_OU" = c("BM", "EB", "lambda", "delta", "mean_trend")
+)
+
+if (using_named_downstream_model_set && identical(pipeline_stage, "model_fit")) {
+  stop(
+    "--model-set / MODEL_SET is for downstream root_reconstruction, pca_projection, plot, or all. ",
+    "Do not combine it with --stage=model_fit."
+  )
+}
 
 if (!identical(model_fit_variable, "all")) {
   if (!identical(pipeline_stage, "model_fit")) {
@@ -598,17 +675,16 @@ variance_from_ci <- function(ci_low, ci_high) {
   ((ci_high - ci_low) / (2 * stats::qnorm(0.975)))^2
 }
 
-transform_tree_for_primary_model <- function(tree, fit_obj, primary_model) {
+transform_tree_for_primary_model <- function(tree, fit_obj, primary_model, parameter_summary = NA_character_) {
   if (primary_model == "BM") {
     return(list(tree = tree, transform_parameter = NA_real_, transform_status = "not_applicable"))
   }
 
-  if (is.null(fit_obj) || is.null(fit_obj$opt)) {
-    stop("Primary model ", primary_model, " has no valid fit object or opt slot")
-  }
-
   if (primary_model == "lambda") {
     lambda <- extract_fit_parameter(fit_obj, c("lambda"))
+    if (!is.finite(lambda)) {
+      lambda <- extract_parameter_from_summary(parameter_summary, "lambda")
+    }
     if (!is.finite(lambda)) stop("lambda model selected, but no finite lambda parameter was found")
     return(list(
       tree = geiger::lambdaTree(tree, lambda = lambda),
@@ -619,6 +695,9 @@ transform_tree_for_primary_model <- function(tree, fit_obj, primary_model) {
 
   if (primary_model == "delta") {
     delta <- extract_fit_parameter(fit_obj, c("delta"))
+    if (!is.finite(delta)) {
+      delta <- extract_parameter_from_summary(parameter_summary, "delta")
+    }
     if (!is.finite(delta) || delta <= 0) {
       stop("delta model selected, but no finite positive delta parameter was found")
     }
@@ -632,10 +711,15 @@ transform_tree_for_primary_model <- function(tree, fit_obj, primary_model) {
   stop("Unsupported primary reconstruction model: ", primary_model)
 }
 
-reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_obj) {
+reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_obj = NULL, parameter_summary = NA_character_) {
   tryCatch(
     {
-      tree_info <- transform_tree_for_primary_model(tree, fit_obj, primary_model)
+      tree_info <- transform_tree_for_primary_model(
+        tree,
+        fit_obj = fit_obj,
+        primary_model = primary_model,
+        parameter_summary = parameter_summary
+      )
       recon_tree <- tree_info$tree
       trait_reordered <- trait[recon_tree$tip.label]
 
@@ -693,6 +777,18 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
       )
     }
   )
+}
+
+lookup_model_fit_row <- function(model_fit_table, target_variable, target_model) {
+  hits <- model_fit_table %>%
+    filter(.data$variable == .env$target_variable, .data$model == .env$target_model) %>%
+    slice(1)
+
+  if (nrow(hits) == 0) {
+    return(NULL)
+  }
+
+  hits
 }
 
 compute_sensitivity_root <- function(tree, trait, variable, sensitivity_model) {
@@ -758,6 +854,116 @@ compute_sensitivity_root <- function(tree, trait, variable, sensitivity_model) {
   )
 }
 
+reconstruct_named_model_root <- function(tree, trait, variable, best_overall_model, primary_model, model_fit_table) {
+  if (best_overall_model %in% primary_models) {
+    fit_row <- lookup_model_fit_row(model_fit_table, variable, best_overall_model)
+    if (is.null(fit_row)) {
+      return(tibble(
+        variable = variable,
+        reconstruction_model = best_overall_model,
+        transform_parameter = NA_real_,
+        transform_status = "failed",
+        root_estimate = NA_real_,
+        root_variance = NA_real_,
+        root_variance_source = "unavailable",
+        CI_low = NA_real_,
+        CI_high = NA_real_,
+        reconstruction_status = "failed",
+        reconstruction_error = paste0("Missing fit row for ", variable, "/", best_overall_model, " in named model-fit attempts table."),
+        reconstruction_fallback_reason = NA_character_
+      ))
+    }
+
+    return(
+      reconstruct_primary_root(
+        tree = tree,
+        trait = trait,
+        variable = variable,
+        primary_model = best_overall_model,
+        parameter_summary = fit_row$parameter_summary[[1]]
+      ) %>%
+        mutate(reconstruction_fallback_reason = NA_character_)
+    )
+  }
+
+  if (best_overall_model %in% c("EB", "mean_trend")) {
+    sensitivity_row <- compute_sensitivity_root(tree, trait, variable, best_overall_model)
+    if (is.finite(sensitivity_row$sensitivity_root_estimate[[1]])) {
+      fit_row <- lookup_model_fit_row(model_fit_table, variable, best_overall_model)
+      fitted_parameter <- NA_real_
+      if (!is.null(fit_row)) {
+        fitted_parameter <- extract_parameter_from_summary(
+          fit_row$parameter_summary[[1]],
+          if (best_overall_model == "EB") "a" else "drift"
+        )
+      }
+
+      return(tibble(
+        variable = variable,
+        reconstruction_model = best_overall_model,
+        transform_parameter = fitted_parameter,
+        transform_status = "direct_named_model_sensitivity_reconstruction",
+        root_estimate = sensitivity_row$sensitivity_root_estimate[[1]],
+        root_variance = NA_real_,
+        root_variance_source = "unavailable_for_direct_named_model_sensitivity_reconstruction",
+        CI_low = NA_real_,
+        CI_high = NA_real_,
+        reconstruction_status = if_else(
+          identical(sensitivity_row$sensitivity_status[[1]], "ok"),
+          "ok_root_variance_unavailable",
+          paste0("ok_root_variance_unavailable_", sensitivity_row$sensitivity_status[[1]])
+        ),
+        reconstruction_error = sensitivity_row$sensitivity_error[[1]],
+        reconstruction_fallback_reason = NA_character_
+      ))
+    }
+  }
+
+  fallback_reason <- paste0(
+    "Best model ", best_overall_model,
+    " was not directly usable for downstream root reconstruction; falling back to reconstructable primary model ",
+    primary_model,
+    "."
+  )
+
+  if (!is.na(primary_model) && primary_model %in% primary_models) {
+    fit_row <- lookup_model_fit_row(model_fit_table, variable, primary_model)
+    if (!is.null(fit_row)) {
+      return(
+        reconstruct_primary_root(
+          tree = tree,
+          trait = trait,
+          variable = variable,
+          primary_model = primary_model,
+          parameter_summary = fit_row$parameter_summary[[1]]
+        ) %>%
+          mutate(reconstruction_fallback_reason = fallback_reason)
+      )
+    }
+  }
+
+  tibble(
+    variable = variable,
+    reconstruction_model = NA_character_,
+    transform_parameter = NA_real_,
+    transform_status = "failed",
+    root_estimate = NA_real_,
+    root_variance = NA_real_,
+    root_variance_source = "unavailable",
+    CI_low = NA_real_,
+    CI_high = NA_real_,
+    reconstruction_status = "failed",
+    reconstruction_error = paste0(
+      "No reconstructable downstream model was available for ",
+      variable,
+      " after named-set winner ",
+      best_overall_model,
+      "."
+    ),
+    reconstruction_fallback_reason = fallback_reason
+  )
+}
+
 # -----------------------------
 # Biological diagnostics
 # -----------------------------
@@ -779,11 +985,13 @@ calculate_extant_stats <- function(X) {
 
 classify_variable_interpretability <- function(
   root_estimate, root_z, root_within_range, ci_width_ratio,
-  primary_delta_from_best, best_overall_model, reconstruction_status
+  primary_delta_from_best, best_overall_model, reconstruction_status, reconstruction_model
 ) {
   flags <- c()
   if (!identical(reconstruction_status, "ok")) flags <- c(flags, "primary_reconstruction_uncertain")
-  if (best_overall_model %in% sensitivity_models) flags <- c(flags, "best_model_sensitivity_only")
+  if (!is.na(best_overall_model) && !is.na(reconstruction_model) && best_overall_model != reconstruction_model) {
+    flags <- c(flags, "best_model_not_used_for_reconstruction")
+  }
   if (is.finite(primary_delta_from_best) && primary_delta_from_best > primary_delta_warning) {
     flags <- c(flags, "primary_model_AICc_penalty")
   }
@@ -812,6 +1020,13 @@ calculate_root_diagnostics <- function(root_table) {
         (root_estimate - extant_mean) / extant_sd,
         NA_real_
       ),
+      root_position_relative_to_extant_distribution = case_when(
+        !is.finite(root_estimate) ~ "unknown_no_root_estimate",
+        !root_lies_within_extant_observed_range ~ "outside_extant_distribution",
+        abs(standardized_root_position_relative_to_extant_mean_SD) <= 1 ~ "central_within_extant_distribution",
+        abs(standardized_root_position_relative_to_extant_mean_SD) <= root_abs_z_warning ~ "marginal_within_extant_distribution",
+        TRUE ~ "extreme_within_extant_distribution"
+      ),
       ecologically_plausible_rule = case_when(
         !is.finite(root_estimate) ~ "unknown_no_root_estimate",
         root_lies_within_extant_observed_range &
@@ -827,11 +1042,12 @@ calculate_root_diagnostics <- function(root_table) {
         CI_width_to_extant_range,
         primary_delta_from_best,
         best_overall_model,
-        reconstruction_status
+        reconstruction_status,
+        reconstruction_model
       ),
       variable_interpretation_class = case_when(
         interpretability_flag == "none" ~ "robust",
-        str_detect(interpretability_flag, "primary_model_AICc_penalty|root_outside|CI_spans|best_model_sensitivity_only") ~ "fragile",
+        str_detect(interpretability_flag, "primary_model_AICc_penalty|root_outside|CI_spans|best_model_not_used_for_reconstruction") ~ "fragile",
         TRUE ~ "tentative"
       ),
       contributes_to_main_root_estimate = is.finite(root_estimate) & reconstruction_status %in% c("ok", "ok_root_variance_unavailable"),
@@ -1155,7 +1371,7 @@ project_root_uncertainty_to_pca <- function(root_projection_table, pca_obj, root
 # -----------------------------
 build_sensitivity_comparison <- function(root_table) {
   root_table %>%
-    filter(best_overall_model %in% sensitivity_models) %>%
+    filter(best_overall_model %in% sensitivity_models, best_overall_model != reconstruction_model) %>%
     transmute(
       variable,
       best_overall_model,
@@ -1562,70 +1778,115 @@ crown_node <- as.character(Ntip(tree_pruned) + 1)
 # -----------------------------
 # Stage: model fitting
 # -----------------------------
-message("Fitting or loading per-variable geiger::fitContinuous model fits.")
-message("Model-fit variable scope: ", paste(model_fit_variables, collapse = ", "))
-message("Model-fit model scope: ", paste(model_fit_models, collapse = ", "))
-
 fit_cache_objects <- list()
-for (v in model_fit_variables) {
-  trait <- X[[v]]
-  names(trait) <- rownames(X)
-  trait <- trait[tree_pruned$tip.label]
-  fit_cache_objects[[v]] <- fit_models_for_variable(
-    tree_pruned,
-    trait,
-    v,
-    models_to_fit = model_fit_models
-  )
-}
+named_downstream_inputs <- NULL
 
-model_fit_attempts <- bind_rows(lapply(fit_cache_objects, `[[`, "model_rows")) %>%
-  add_model_deltas()
+if (using_named_downstream_model_set && !identical(pipeline_stage, "model_fit")) {
+  message("Using precomputed downstream model universe: ", downstream_model_set)
+  named_downstream_inputs <- load_named_downstream_model_set(downstream_model_set)
+  expected_models <- named_downstream_model_sets[[downstream_model_set]]
 
-if (model_fit_is_shard) {
-  write_csv(model_fit_attempts, file.path(output_dir, "model_fit_shard_attempts.csv"))
-  if (setequal(model_fit_models, candidate_models)) {
-    write_csv(
-      summarize_model_selection(model_fit_attempts),
-      file.path(output_dir, "model_fit_shard_selection.csv")
+  model_fit_attempts <- named_downstream_inputs$fit_attempts %>%
+    filter(.data$variable %in% climate_vars, .data$model %in% expected_models) %>%
+    add_model_deltas()
+
+  model_selection <- named_downstream_inputs$model_selection %>%
+    filter(.data$variable %in% climate_vars)
+
+  if (nrow(model_selection) != length(climate_vars)) {
+    stop(
+      "Named downstream model-selection table for ",
+      downstream_model_set,
+      " must contain exactly ",
+      length(climate_vars),
+      " climate variables."
     )
   }
 
-  completion_lines <- c(
-    "stage=model_fit",
-    "mode=shard",
-    paste0("model_fit_variable=", model_fit_variable),
-    paste0("model_fit_model=", model_fit_model),
-    paste0("variables_completed=", paste(model_fit_variables, collapse = ",")),
-    paste0("models_completed_or_loaded=", paste(model_fit_models, collapse = ",")),
-    paste0("cache_files=", paste(vapply(model_fit_variables, cache_path_for_variable, character(1)), collapse = ",")),
-    paste0("attempt_rows=", nrow(model_fit_attempts)),
-    paste0("completed_at_utc=", format(Sys.time(), tz = "UTC", usetz = TRUE))
-  )
-  writeLines(completion_lines, file.path(output_dir, "model_fit_shard_completion.txt"))
-  message("Stage model_fit shard complete. Stopping before full model-fit aggregation.")
-  quit(save = "no", status = 0)
-}
+  if (!all(model_selection$variable %in% climate_vars)) {
+    stop("Named downstream model-selection table contains unexpected climate variables.")
+  }
 
-write_csv(model_fit_attempts, file.path(output_dir, "per_variable_model_fit_attempts_detailed.csv"))
+  if (any(is.na(model_selection$best_overall_model))) {
+    stop(
+      "Named downstream model-selection table has missing best_overall_model entries for: ",
+      paste(model_selection$variable[is.na(model_selection$best_overall_model)], collapse = ", ")
+    )
+  }
 
-if (any(!is.finite(model_fit_attempts$AICc))) {
-  failed_fit_count <- sum(!is.finite(model_fit_attempts$AICc))
-  add_pipeline_warning(paste0(failed_fit_count, " model fits did not return finite AICc; see per_variable_model_fit_attempts_detailed.csv."))
-}
+  if (any(!model_selection$best_overall_model %in% expected_models)) {
+    stop(
+      "Named downstream model-selection table contains models outside ",
+      downstream_model_set,
+      ": ",
+      paste(unique(model_selection$best_overall_model[!model_selection$best_overall_model %in% expected_models]), collapse = ", ")
+    )
+  }
+} else {
+  message("Fitting or loading per-variable geiger::fitContinuous model fits.")
+  message("Model-fit variable scope: ", paste(model_fit_variables, collapse = ", "))
+  message("Model-fit model scope: ", paste(model_fit_models, collapse = ", "))
 
-model_selection <- summarize_model_selection(model_fit_attempts)
-if (any(is.na(model_selection$best_overall_model))) {
-  stop(
-    "At least one variable has no finite AICc model fit: ",
-    paste(model_selection$variable[is.na(model_selection$best_overall_model)], collapse = ", ")
-  )
-}
-if (any(is.na(model_selection$primary_model))) {
-  stop(
-    "At least one variable has no finite primary model fit among BM/lambda/delta: ",
-    paste(model_selection$variable[is.na(model_selection$primary_model)], collapse = ", ")
-  )
+  for (v in model_fit_variables) {
+    trait <- X[[v]]
+    names(trait) <- rownames(X)
+    trait <- trait[tree_pruned$tip.label]
+    fit_cache_objects[[v]] <- fit_models_for_variable(
+      tree_pruned,
+      trait,
+      v,
+      models_to_fit = model_fit_models
+    )
+  }
+
+  model_fit_attempts <- bind_rows(lapply(fit_cache_objects, `[[`, "model_rows")) %>%
+    add_model_deltas()
+
+  if (model_fit_is_shard) {
+    write_csv(model_fit_attempts, file.path(output_dir, "model_fit_shard_attempts.csv"))
+    if (setequal(model_fit_models, candidate_models)) {
+      write_csv(
+        summarize_model_selection(model_fit_attempts),
+        file.path(output_dir, "model_fit_shard_selection.csv")
+      )
+    }
+
+    completion_lines <- c(
+      "stage=model_fit",
+      "mode=shard",
+      paste0("model_fit_variable=", model_fit_variable),
+      paste0("model_fit_model=", model_fit_model),
+      paste0("variables_completed=", paste(model_fit_variables, collapse = ",")),
+      paste0("models_completed_or_loaded=", paste(model_fit_models, collapse = ",")),
+      paste0("cache_files=", paste(vapply(model_fit_variables, cache_path_for_variable, character(1)), collapse = ",")),
+      paste0("attempt_rows=", nrow(model_fit_attempts)),
+      paste0("completed_at_utc=", format(Sys.time(), tz = "UTC", usetz = TRUE))
+    )
+    writeLines(completion_lines, file.path(output_dir, "model_fit_shard_completion.txt"))
+    message("Stage model_fit shard complete. Stopping before full model-fit aggregation.")
+    quit(save = "no", status = 0)
+  }
+
+  write_csv(model_fit_attempts, file.path(output_dir, "per_variable_model_fit_attempts_detailed.csv"))
+
+  if (any(!is.finite(model_fit_attempts$AICc))) {
+    failed_fit_count <- sum(!is.finite(model_fit_attempts$AICc))
+    add_pipeline_warning(paste0(failed_fit_count, " model fits did not return finite AICc; see per_variable_model_fit_attempts_detailed.csv."))
+  }
+
+  model_selection <- summarize_model_selection(model_fit_attempts)
+  if (any(is.na(model_selection$best_overall_model))) {
+    stop(
+      "At least one variable has no finite AICc model fit: ",
+      paste(model_selection$variable[is.na(model_selection$best_overall_model)], collapse = ", ")
+    )
+  }
+  if (any(is.na(model_selection$primary_model))) {
+    stop(
+      "At least one variable has no finite primary model fit among BM/lambda/delta: ",
+      paste(model_selection$variable[is.na(model_selection$primary_model)], collapse = ", ")
+    )
+  }
 }
 
 if (pipeline_stage == "model_fit") {
@@ -1640,137 +1901,273 @@ if (pipeline_stage == "model_fit") {
 # -----------------------------
 # Stage: primary root reconstruction and sensitivity
 # -----------------------------
-message("Reconstructing primary root states in original climate variables.")
+reuse_named_root_reconstruction <- using_named_downstream_model_set &&
+  pipeline_stage %in% c("pca_projection", "plot") &&
+  file.exists(file.path(output_dir, "ancestral_root_original_climate_strict.csv"))
 
-root_rows <- list()
-for (v in climate_vars) {
-  trait <- X[[v]]
-  names(trait) <- rownames(X)
-  trait <- trait[tree_pruned$tip.label]
-
-  selected <- model_selection %>% filter(variable == v)
-  root_rows[[length(root_rows) + 1]] <- reconstruct_primary_root(
-    tree = tree_pruned,
-    trait = trait,
-    variable = v,
-    primary_model = selected$primary_model,
-    fit_obj = fit_cache_objects[[v]]$fit_objects[[selected$primary_model]]
+if (reuse_named_root_reconstruction) {
+  message("Reusing previously written named-set root reconstruction outputs.")
+  ancestral_root_original <- read_required_csv(
+    file.path(output_dir, "ancestral_root_original_climate_strict.csv"),
+    "Existing root reconstruction table"
   )
-}
-
-primary_root <- bind_rows(root_rows)
-
-sensitivity_rows <- list()
-for (v in climate_vars) {
-  trait <- X[[v]]
-  names(trait) <- rownames(X)
-  trait <- trait[tree_pruned$tip.label]
-  selected <- model_selection %>% filter(variable == v)
-  sensitivity_rows[[length(sensitivity_rows) + 1]] <- compute_sensitivity_root(
-    tree_pruned,
-    trait,
-    variable = v,
-    sensitivity_model = selected$best_overall_model
-  )
-}
-sensitivity_root <- bind_rows(sensitivity_rows)
-
-ancestral_root_original <- model_selection %>%
-  left_join(primary_root, by = "variable") %>%
-  left_join(sensitivity_root, by = "variable") %>%
-  left_join(extant_stats, by = "variable") %>%
-  calculate_root_diagnostics()
-
-per_variable_model_fits <- ancestral_root_original %>%
-  transmute(
-    variable,
-    best_overall_model,
-    best_overall_AICc,
-    primary_model,
-    primary_AICc,
-    primary_delta_from_best,
-    caution_flag = interpretability_flag,
-    contributes_to_main_root_estimate,
-    contributes_to_uncertainty_ellipse
-  )
-
-write_csv(per_variable_model_fits, file.path(output_dir, "per_variable_model_fits.csv"))
-write_csv(ancestral_root_original, file.path(output_dir, "ancestral_root_original_climate_strict.csv"))
-
-sensitivity_comparison <- build_sensitivity_comparison(ancestral_root_original)
-write_csv(sensitivity_comparison, file.path(output_dir, "sensitivity_comparison_summary.csv"))
-
-coherence_diagnostics <- cross_variable_coherence_diagnostics(ancestral_root_original)
-write_csv(coherence_diagnostics, file.path(output_dir, "cross_variable_climate_coherence_diagnostics.csv"))
-
-non_primary_best_prop <- mean(ancestral_root_original$best_overall_model %in% sensitivity_models, na.rm = TRUE)
-if (non_primary_best_prop > sensitivity_winner_prop_warning) {
-  add_pipeline_warning(paste0(
-    "High proportion of variables have sensitivity-only best models: ",
-    signif(non_primary_best_prop, 3)
-  ))
-}
-
-bad_delta <- ancestral_root_original %>%
-  filter(is.finite(primary_delta_from_best), primary_delta_from_best > primary_delta_warning)
-if (nrow(bad_delta) > 0) {
-  add_pipeline_warning(paste0(
-    "Primary model is worse than best overall model by > ",
-    primary_delta_warning,
-    " AICc for: ",
-    paste(bad_delta$variable, collapse = ", ")
-  ))
-}
-
-wide_ci <- ancestral_root_original %>%
-  filter(CI_extremely_wide)
-if (nrow(wide_ci) > 0) {
-  add_pipeline_warning(paste0(
-    "Extremely wide root CIs relative to extant ranges for: ",
-    paste(wide_ci$variable, collapse = ", ")
-  ))
-}
-
-root_projection_table <- ancestral_root_original %>%
-  mutate(
-    projection_value = if_else(is.finite(root_estimate), root_estimate, extant_mean),
-    projection_value_source = if_else(
-      is.finite(root_estimate),
-      "primary_reconstruction",
-      "extant_mean_fallback_for_projection_only"
-    ),
-    variance_used_for_uncertainty = if_else(
-      is.finite(root_variance) & root_variance > 0,
-      root_variance,
-      0
-    ),
-    uncertainty_source = if_else(
-      is.finite(root_variance) & root_variance > 0,
-      root_variance_source,
-      "omitted_from_uncertainty"
+  named_root_output <- if (file.exists(model_set_file_path("ancestral_root_original_climate"))) {
+    read_required_csv(
+      model_set_file_path("ancestral_root_original_climate"),
+      paste0("Existing named root output table for ", downstream_model_set)
     )
-  ) %>%
-  select(
-    variable,
-    projection_value,
-    projection_value_source,
-    variance_used_for_uncertainty,
-    uncertainty_source
-  )
-write_csv(root_projection_table, file.path(output_dir, "ancestral_root_vector_used_for_PCA_projection_strict.csv"))
+  } else {
+    NULL
+  }
+  per_variable_model_fits <- if (file.exists(file.path(output_dir, "per_variable_model_fits.csv"))) {
+    read_required_csv(file.path(output_dir, "per_variable_model_fits.csv"), "Existing per-variable model fits table")
+  } else {
+    ancestral_root_original %>%
+      transmute(
+        variable,
+        best_overall_model,
+        best_overall_AICc,
+        primary_model,
+        primary_AICc,
+        primary_delta_from_best,
+        caution_flag = interpretability_flag,
+        contributes_to_main_root_estimate,
+        contributes_to_uncertainty_ellipse
+      )
+  }
+  sensitivity_comparison <- if (file.exists(file.path(output_dir, "sensitivity_comparison_summary.csv"))) {
+    read_required_csv(file.path(output_dir, "sensitivity_comparison_summary.csv"), "Existing sensitivity comparison table")
+  } else {
+    build_sensitivity_comparison(ancestral_root_original)
+  }
+  coherence_diagnostics <- if (file.exists(file.path(output_dir, "cross_variable_climate_coherence_diagnostics.csv"))) {
+    read_required_csv(file.path(output_dir, "cross_variable_climate_coherence_diagnostics.csv"), "Existing coherence diagnostics table")
+  } else {
+    cross_variable_coherence_diagnostics(ancestral_root_original)
+  }
+  root_projection_table <- if (file.exists(file.path(output_dir, "ancestral_root_vector_used_for_PCA_projection_strict.csv"))) {
+    read_required_csv(
+      file.path(output_dir, "ancestral_root_vector_used_for_PCA_projection_strict.csv"),
+      "Existing root projection table"
+    )
+  } else {
+    ancestral_root_original %>%
+      mutate(
+        projection_value = if_else(is.finite(root_estimate), root_estimate, extant_mean),
+        projection_value_source = if_else(
+          is.finite(root_estimate),
+          "primary_reconstruction",
+          "extant_mean_fallback_for_projection_only"
+        ),
+        variance_used_for_uncertainty = if_else(
+          is.finite(root_variance) & root_variance > 0,
+          root_variance,
+          0
+        ),
+        uncertainty_source = if_else(
+          is.finite(root_variance) & root_variance > 0,
+          root_variance_source,
+          "omitted_from_uncertainty"
+        )
+      ) %>%
+      select(
+        variable,
+        projection_value,
+        projection_value_source,
+        variance_used_for_uncertainty,
+        uncertainty_source
+      )
+  }
+} else {
+  message("Reconstructing primary root states in original climate variables.")
 
-if (save_intermediate_rds) {
-  saveRDS(
-    list(
-      model_fit_attempts = model_fit_attempts,
-      model_selection = model_selection,
-      ancestral_root_original = ancestral_root_original,
-      root_projection_table = root_projection_table,
-      sensitivity_comparison = sensitivity_comparison,
-      coherence_diagnostics = coherence_diagnostics
-    ),
-    file.path(cache_dir, "root_reconstruction_intermediate.rds")
+  root_rows <- list()
+  for (v in climate_vars) {
+    trait <- X[[v]]
+    names(trait) <- rownames(X)
+    trait <- trait[tree_pruned$tip.label]
+
+    selected <- model_selection %>% filter(variable == v)
+    if (using_named_downstream_model_set) {
+      root_rows[[length(root_rows) + 1]] <- reconstruct_named_model_root(
+        tree = tree_pruned,
+        trait = trait,
+        variable = v,
+        best_overall_model = selected$best_overall_model[[1]],
+        primary_model = selected$primary_model[[1]],
+        model_fit_table = model_fit_attempts
+      )
+    } else {
+      root_rows[[length(root_rows) + 1]] <- reconstruct_primary_root(
+        tree = tree_pruned,
+        trait = trait,
+        variable = v,
+        primary_model = selected$primary_model,
+        fit_obj = fit_cache_objects[[v]]$fit_objects[[selected$primary_model]]
+      ) %>%
+        mutate(reconstruction_fallback_reason = NA_character_)
+    }
+  }
+
+  primary_root <- bind_rows(root_rows)
+
+  sensitivity_rows <- list()
+  for (v in climate_vars) {
+    trait <- X[[v]]
+    names(trait) <- rownames(X)
+    trait <- trait[tree_pruned$tip.label]
+    selected <- model_selection %>% filter(variable == v)
+    sensitivity_rows[[length(sensitivity_rows) + 1]] <- compute_sensitivity_root(
+      tree_pruned,
+      trait,
+      variable = v,
+      sensitivity_model = selected$best_overall_model
+    )
+  }
+  sensitivity_root <- bind_rows(sensitivity_rows)
+
+  ancestral_root_original <- model_selection %>%
+    left_join(primary_root, by = "variable") %>%
+    left_join(sensitivity_root, by = "variable") %>%
+    left_join(extant_stats, by = "variable") %>%
+    calculate_root_diagnostics()
+
+  named_root_output <- NULL
+  if (using_named_downstream_model_set) {
+    named_root_output <- ancestral_root_original %>%
+      transmute(
+        variable,
+        best_model_5models_no_OU = best_overall_model,
+        reconstruction_model_used = reconstruction_model,
+        winning_model_used_for_reconstruction = best_overall_model == reconstruction_model,
+        reconstruction_fallback_reason = if_else(
+          is.na(reconstruction_fallback_reason) | reconstruction_fallback_reason == "",
+          "none",
+          reconstruction_fallback_reason
+        ),
+        root_estimate,
+        CI_low,
+        CI_high,
+        extant_mean,
+        extant_sd,
+        extant_min,
+        extant_max,
+        root_position_relative_to_extant_distribution,
+        caution_flag = interpretability_flag
+      )
+  }
+
+  per_variable_model_fits <- ancestral_root_original %>%
+    transmute(
+      variable,
+      best_overall_model,
+      best_overall_AICc,
+      primary_model,
+      primary_AICc,
+      primary_delta_from_best,
+      caution_flag = interpretability_flag,
+      contributes_to_main_root_estimate,
+      contributes_to_uncertainty_ellipse
+    )
+
+  write_csv(per_variable_model_fits, file.path(output_dir, "per_variable_model_fits.csv"))
+  write_csv(ancestral_root_original, file.path(output_dir, "ancestral_root_original_climate_strict.csv"))
+  if (using_named_downstream_model_set) {
+    write_csv(named_root_output, model_set_file_path("ancestral_root_original_climate"))
+    write_csv(
+      named_root_output %>% filter(!winning_model_used_for_reconstruction),
+      model_set_file_path("reconstruction_model_differences")
+    )
+  }
+
+  sensitivity_comparison <- build_sensitivity_comparison(ancestral_root_original)
+  write_csv(sensitivity_comparison, file.path(output_dir, "sensitivity_comparison_summary.csv"))
+
+  coherence_diagnostics <- cross_variable_coherence_diagnostics(ancestral_root_original)
+  write_csv(coherence_diagnostics, file.path(output_dir, "cross_variable_climate_coherence_diagnostics.csv"))
+
+  non_primary_best_prop <- mean(ancestral_root_original$best_overall_model %in% sensitivity_models, na.rm = TRUE)
+  if (non_primary_best_prop > sensitivity_winner_prop_warning) {
+    add_pipeline_warning(paste0(
+      "High proportion of variables have sensitivity-only best models: ",
+      signif(non_primary_best_prop, 3)
+    ))
+  }
+
+  fallback_prop <- mean(
+    ancestral_root_original$best_overall_model != ancestral_root_original$reconstruction_model,
+    na.rm = TRUE
   )
+  if (using_named_downstream_model_set && is.finite(fallback_prop) && fallback_prop > 0.25) {
+    add_pipeline_warning(paste0(
+      "More than 25% of variables required reconstruction fallback in the ",
+      downstream_model_set,
+      " downstream universe: ",
+      signif(fallback_prop, 3)
+    ))
+  }
+
+  bad_delta <- ancestral_root_original %>%
+    filter(is.finite(primary_delta_from_best), primary_delta_from_best > primary_delta_warning)
+  if (nrow(bad_delta) > 0) {
+    add_pipeline_warning(paste0(
+      "Primary model is worse than best overall model by > ",
+      primary_delta_warning,
+      " AICc for: ",
+      paste(bad_delta$variable, collapse = ", ")
+    ))
+  }
+
+  wide_ci <- ancestral_root_original %>%
+    filter(CI_extremely_wide)
+  if (nrow(wide_ci) > 0) {
+    add_pipeline_warning(paste0(
+      "Extremely wide root CIs relative to extant ranges for: ",
+      paste(wide_ci$variable, collapse = ", ")
+    ))
+  }
+
+  root_projection_table <- ancestral_root_original %>%
+    mutate(
+      projection_value = if_else(is.finite(root_estimate), root_estimate, extant_mean),
+      projection_value_source = if_else(
+        is.finite(root_estimate),
+        "primary_reconstruction",
+        "extant_mean_fallback_for_projection_only"
+      ),
+      variance_used_for_uncertainty = if_else(
+        is.finite(root_variance) & root_variance > 0,
+        root_variance,
+        0
+      ),
+      uncertainty_source = if_else(
+        is.finite(root_variance) & root_variance > 0,
+        root_variance_source,
+        "omitted_from_uncertainty"
+      )
+    ) %>%
+    select(
+      variable,
+      projection_value,
+      projection_value_source,
+      variance_used_for_uncertainty,
+      uncertainty_source
+    )
+  write_csv(root_projection_table, file.path(output_dir, "ancestral_root_vector_used_for_PCA_projection_strict.csv"))
+
+  if (save_intermediate_rds) {
+    saveRDS(
+      list(
+        model_fit_attempts = model_fit_attempts,
+        model_selection = model_selection,
+        ancestral_root_original = ancestral_root_original,
+        root_projection_table = root_projection_table,
+        sensitivity_comparison = sensitivity_comparison,
+        coherence_diagnostics = coherence_diagnostics
+      ),
+      file.path(cache_dir, "root_reconstruction_intermediate.rds")
+    )
+  }
 }
 
 if (pipeline_stage == "root_reconstruction") {
@@ -1843,6 +2240,10 @@ interpretability_metrics <- tibble(
   number_of_variables_with_caution_flags = sum(ancestral_root_original$interpretability_flag != "none"),
   median_primary_delta_from_best = median(ancestral_root_original$primary_delta_from_best, na.rm = TRUE),
   number_of_variables_with_non_primary_best_model = sum(ancestral_root_original$best_overall_model %in% sensitivity_models),
+  number_of_variables_where_reconstruction_differs_from_best_model = sum(
+    ancestral_root_original$best_overall_model != ancestral_root_original$reconstruction_model,
+    na.rm = TRUE
+  ),
   number_of_variables_where_root_outside_extant_range = sum(!ancestral_root_original$root_lies_within_extant_observed_range, na.rm = TRUE),
   root_mahalanobis_distance_squared_in_PCA_space = projection$root_md2,
   root_mahalanobis_distance_in_PCA_space = sqrt(projection$root_md2),
@@ -1850,7 +2251,9 @@ interpretability_metrics <- tibble(
   root_inside_extant_convex_hull_displayed_2D = projection$root_inside_hull,
   ellipse_95_area_to_extant_hull_area_ratio = ellipse_95_ratio,
   covariance_condition_number = uncertainty_projection$cov_info$condition_number,
-  covariance_used_nearPD = uncertainty_projection$cov_info$used_near_pd
+  covariance_used_nearPD = uncertainty_projection$cov_info$used_near_pd,
+  model_universe = if_else(using_named_downstream_model_set, downstream_model_set, "standard_full_universe"),
+  OU_status = if_else(using_named_downstream_model_set, "excluded_deferred", "included_if_fit")
 )
 interpretability_metrics$final_classification <- classify_final_result(interpretability_metrics)
 
@@ -1874,6 +2277,101 @@ write_interpretation_summary(
   sensitivity_comparison,
   pipeline_warnings
 )
+
+if (using_named_downstream_model_set) {
+  write_csv(projected_root_point, model_set_file_path("ancestral_root_projected_PCA_point"))
+  write_csv(ellipse_df, model_set_file_path("ancestral_root_projected_PCA_ellipses"))
+  write_csv(interpretability_metrics, model_set_file_path("ancestral_root_interpretability_metrics"))
+
+  named_fallback_vars <- ancestral_root_original$variable[
+    ancestral_root_original$best_overall_model != ancestral_root_original$reconstruction_model
+  ]
+  robust_root_vars <- ancestral_root_original$variable[ancestral_root_original$interpretability_flag == "none"]
+  fragile_root_vars <- ancestral_root_original$variable[ancestral_root_original$interpretability_flag != "none"]
+  thermal_positions <- ancestral_root_original %>%
+    filter(.data$variable %in% thermal_vars) %>%
+    transmute(line = paste0(.data$variable, "=", .data$root_position_relative_to_extant_distribution)) %>%
+    pull(line)
+  precipitation_positions <- ancestral_root_original %>%
+    filter(.data$variable %in% precip_vars) %>%
+    transmute(line = paste0(.data$variable, "=", .data$root_position_relative_to_extant_distribution)) %>%
+    pull(line)
+
+  writeLines(
+    c(
+      "Result Block 1 root interpretation summary (5models_no_OU)",
+      "========================================================",
+      "",
+      "Model universe:",
+      "BM, EB, lambda, delta, and mean_trend.",
+      "OU was excluded/deferred because full-tree OU fitting remained computationally intractable under the available compute setup.",
+      "",
+      "Core method statement:",
+      "Ancestral climate was reconstructed in the original climate variables.",
+      "PCA was used only to project the reconstructed root for visualization and diagnostics.",
+      "",
+      paste0("Projected root status in displayed PCA space: ", projection$root_cloud_status),
+      paste0("Projected root inside displayed extant convex hull: ", projection$root_inside_hull),
+      paste0("Projected root Mahalanobis distance squared: ", signif(projection$root_md2, 4)),
+      paste0("95% ellipse / extant convex hull area ratio: ", signif(ellipse_95_ratio, 4)),
+      paste0("Variables where reconstruction differed from the winning model: ", interpretability_metrics$number_of_variables_where_reconstruction_differs_from_best_model),
+      "",
+      "Thermal variable root positions relative to extant distributions:",
+      if (length(thermal_positions) == 0) "none" else paste(thermal_positions, collapse = "\n"),
+      "",
+      "Precipitation variable root positions relative to extant distributions:",
+      if (length(precipitation_positions) == 0) "none" else paste(precipitation_positions, collapse = "\n"),
+      "",
+      "Variables with robust root estimates:",
+      if (length(robust_root_vars) == 0) "none" else paste(robust_root_vars, collapse = ", "),
+      "",
+      "Variables with fragile or flagged root estimates:",
+      if (length(fragile_root_vars) == 0) "none" else paste(fragile_root_vars, collapse = ", "),
+      "",
+      "Variables requiring fallback reconstruction:",
+      if (length(named_fallback_vars) == 0) "none" else paste(named_fallback_vars, collapse = ", "),
+      "",
+      "Warnings raised during this downstream run:",
+      if (length(pipeline_warnings) == 0) "none" else paste(unique(pipeline_warnings), collapse = "\n"),
+      "",
+      "Important limitation:",
+      "This is a five-model/no-OU Result Block 1 analysis, not the final six-model universe.",
+      "Do not describe PCA as the inferential basis of ancestral reconstruction."
+    ),
+    model_set_file_path("biological_interpretation_summary_root", ext = "txt")
+  )
+
+  readme_lines <- c(
+    "Result Block 1 downstream readme (5models_no_OU)",
+    "===============================================",
+    "",
+    "Model universe used:",
+    "BM, EB, lambda, delta, mean_trend.",
+    "OU status: excluded/deferred, not unsupported.",
+    "",
+    "Why OU is absent here:",
+    "Full-tree OU fitting remained computationally intractable under the available hosted-runner/local compute setup.",
+    "The completed five-model/no-OU model-fit aggregation is therefore the explicit downstream model universe for this run.",
+    "",
+    "How to interpret these outputs:",
+    "1. ancestral_root_original_climate_5models_no_OU.csv is the per-variable ancestral reconstruction in original climate variables.",
+    "2. ancestral_root_projected_PCA_point_5models_no_OU.csv and ancestral_root_projected_PCA_ellipses_5models_no_OU.csv are visualization/diagnostic projections only.",
+    "3. ancestral_climatic_core_plot_5models_no_OU.* is a figure derived from the projected root, not the inferential basis of reconstruction.",
+    "4. biological_interpretation_summary_root_5models_no_OU.txt is the manuscript-facing summary for this five-model/no-OU Result Block 1 run.",
+    "",
+    "What should not be claimed:",
+    "- Do not describe this as a six-model result.",
+    "- Do not describe PCA as ancestral inference.",
+    "- Do not treat OU as rejected; it was excluded/deferred for operational reasons.",
+    "",
+    "Upstream model-fit provenance:",
+    named_downstream_inputs$metadata_lines,
+    "",
+    "Upstream five-model biological summary:",
+    named_downstream_inputs$biological_summary_lines
+  )
+  writeLines(readme_lines, model_set_file_path("result_block_1_readme", ext = "txt"))
+}
 
 writeLines(
   c(
@@ -1942,6 +2440,19 @@ if (!skip_plots && pipeline_stage %in% c("all", "plot")) {
     eigenvalues = pca_obj$eigenvalues,
     pca_obj = pca_obj
   )
+
+  if (using_named_downstream_model_set) {
+    file.copy(
+      file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.png"),
+      model_set_file_path("ancestral_climatic_core_plot", ext = "png"),
+      overwrite = TRUE
+    )
+    file.copy(
+      file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.pdf"),
+      model_set_file_path("ancestral_climatic_core_plot", ext = "pdf"),
+      overwrite = TRUE
+    )
+  }
 } else {
   message("Plot generation skipped.")
 }
