@@ -36,7 +36,7 @@
 
 req_pkgs <- c(
   "ape", "geiger", "phytools", "dplyr", "readr", "stringr", "ggplot2",
-  "ggrepel", "tibble", "writexl", "scales", "Matrix"
+  "ggrepel", "tibble", "writexl", "scales", "Matrix", "MASS"
 )
 
 to_install <- req_pkgs[!req_pkgs %in% rownames(installed.packages())]
@@ -114,6 +114,11 @@ downstream_model_set <- match.arg(
   choices = c("standard", "5models_no_OU")
 )
 using_named_downstream_model_set <- !identical(downstream_model_set, "standard")
+climate_set <- str_trim(get_cli_value(args, "climate-set", Sys.getenv("CLIMATE_SET", "all_variables")))
+climate_set <- match.arg(
+  climate_set,
+  choices = c("all_variables", "final_6_variable_core")
+)
 
 min_valid_values <- suppressWarnings(as.integer(Sys.getenv("MIN_VALID_VALUES", "10")))
 if (is.na(min_valid_values) || min_valid_values < 3) min_valid_values <- 10
@@ -337,7 +342,7 @@ classify_ratio_size <- function(ratio) {
 # -----------------------------
 # Climate variable definitions
 # -----------------------------
-climate_vars <- c(
+all_climate_vars <- c(
   "annual_mean_temperature",
   "annual_precipitation",
   "maximum_temperature_warmest_month",
@@ -352,7 +357,7 @@ climate_vars <- c(
   "temperature_seasonality"
 )
 
-thermal_vars <- c(
+all_thermal_vars <- c(
   "annual_mean_temperature",
   "mean_temperature_coldest_quarter",
   "mean_temperature_driest_quarter",
@@ -362,7 +367,7 @@ thermal_vars <- c(
   "temperature_seasonality"
 )
 
-precip_vars <- c(
+all_precip_vars <- c(
   "annual_precipitation",
   "precipitation_in_coldest_quarter",
   "precipitation_of_coldest_quarter",
@@ -370,12 +375,107 @@ precip_vars <- c(
   "precipitation_wettest_month"
 )
 
+climate_set_definitions <- list(
+  all_variables = list(
+    climate_vars = all_climate_vars,
+    thermal_vars = all_thermal_vars,
+    precip_vars = all_precip_vars,
+    output_label = NULL
+  ),
+  final_6_variable_core = list(
+    climate_vars = c(
+      "annual_mean_temperature",
+      "temperature_seasonality",
+      "minimum_temperature_coldest_month",
+      "annual_precipitation",
+      "precipitation_of_wettest_quarter",
+      "precipitation_of_coldest_quarter"
+    ),
+    thermal_vars = c(
+      "annual_mean_temperature",
+      "temperature_seasonality",
+      "minimum_temperature_coldest_month"
+    ),
+    precip_vars = c(
+      "annual_precipitation",
+      "precipitation_of_wettest_quarter",
+      "precipitation_of_coldest_quarter"
+    ),
+    output_label = "final6"
+  )
+)
+
+climate_set_info <- climate_set_definitions[[climate_set]]
+climate_vars <- climate_set_info$climate_vars
+thermal_vars <- climate_set_info$thermal_vars
+precip_vars <- climate_set_info$precip_vars
+
+analysis_output_label <- if (using_named_downstream_model_set) {
+  if (identical(climate_set, "all_variables")) {
+    downstream_model_set
+  } else {
+    paste0(climate_set_info$output_label, "_", downstream_model_set)
+  }
+} else if (identical(climate_set, "all_variables")) {
+  "standard"
+} else {
+  paste0(climate_set_info$output_label, "_standard")
+}
+
+analysis_file_path <- function(stem, ext = "csv", output_label = analysis_output_label) {
+  file.path(output_dir, paste0(stem, "_", output_label, ".", ext))
+}
+
 candidate_models <- c("BM", "OU", "EB", "lambda", "delta", "mean_trend")
 primary_models <- c("BM", "lambda", "delta")
 sensitivity_models <- setdiff(candidate_models, primary_models)
 named_downstream_model_sets <- list(
   "5models_no_OU" = c("BM", "EB", "lambda", "delta", "mean_trend")
 )
+
+archive_existing_outputs <- function(archive_reason) {
+  archive_root <- file.path(output_dir, "archive")
+  dir.create(archive_root, recursive = TRUE, showWarnings = FALSE)
+
+  timestamp_utc <- format(Sys.time(), "%Y%m%dT%H%M%SZ", tz = "UTC")
+  archive_dir <- file.path(
+    archive_root,
+    paste0(timestamp_utc, "_", safe_file_component(archive_reason))
+  )
+  dir.create(archive_dir, recursive = TRUE, showWarnings = FALSE)
+
+  existing_paths <- list.files(output_dir, full.names = TRUE, recursive = FALSE, all.files = FALSE)
+  existing_paths <- existing_paths[basename(existing_paths) != "cache"]
+  existing_paths <- existing_paths[basename(existing_paths) != "archive"]
+  existing_paths <- existing_paths[file.exists(existing_paths)]
+
+  if (length(existing_paths) > 0) {
+    copied <- file.copy(existing_paths, archive_dir, overwrite = TRUE, recursive = TRUE)
+    if (!all(copied)) {
+      add_pipeline_warning(
+        paste0(
+          "Some existing outputs could not be copied into archive directory: ",
+          archive_dir
+        )
+      )
+    }
+  }
+
+  writeLines(
+    c(
+      paste0("archive_reason=", archive_reason),
+      paste0("created_at_utc=", format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC", tz = "UTC")),
+      paste0("pipeline_stage=", pipeline_stage),
+      paste0("model_set=", downstream_model_set),
+      paste0("climate_set=", climate_set),
+      paste0("analysis_output_label=", analysis_output_label),
+      paste0("n_archived_items=", length(existing_paths))
+    ),
+    file.path(archive_dir, "archive_manifest.txt")
+  )
+
+  archive_dir
+}
 
 if (using_named_downstream_model_set && identical(pipeline_stage, "model_fit")) {
   stop(
@@ -415,6 +515,13 @@ model_fit_variables <- if (identical(model_fit_variable, "all")) climate_vars el
 model_fit_models <- if (identical(model_fit_model, "all")) candidate_models else model_fit_model
 model_fit_is_shard <- identical(pipeline_stage, "model_fit") &&
   (!identical(model_fit_variable, "all") || !identical(model_fit_model, "all"))
+
+if (identical(climate_set, "final_6_variable_core") && pipeline_stage %in% c("root_reconstruction", "all")) {
+  archived_dir <- archive_existing_outputs(
+    paste0("before_", analysis_output_label, "_", pipeline_stage)
+  )
+  message("Archived existing Result Block 1 outputs to: ", archived_dir)
+}
 
 # -----------------------------
 # Model fitting helpers
@@ -1379,11 +1486,23 @@ project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
   cloud_cov <- cov(scores_out[, c("display_PCx_oriented", "display_PCy_oriented")])
   cloud_cov_info <- make_positive_definite(cloud_cov, "Extant PCA cloud")
   centroid <- colMeans(scores_out[, c("display_PCx_oriented", "display_PCy_oriented")])
+  extant_md2 <- mahalanobis(
+    scores_out[, c("display_PCx_oriented", "display_PCy_oriented")],
+    center = centroid,
+    cov = cloud_cov_info$cov
+  )
   root_md2 <- as.numeric(mahalanobis(
     cbind(root_display_x, root_display_y),
     center = centroid,
     cov = cloud_cov_info$cov
   ))
+  root_md_percentile <- mean(extant_md2 <= root_md2, na.rm = TRUE)
+  root_md_empirical_classification <- case_when(
+    !is.finite(root_md_percentile) ~ "unknown",
+    root_md_percentile <= 0.50 ~ "central",
+    root_md_percentile <= 0.95 ~ "marginal",
+    TRUE ~ "extreme"
+  )
   root_centroid_distance <- sqrt(sum((c(root_display_x, root_display_y) - centroid)^2))
 
   cloud_status <- case_when(
@@ -1410,8 +1529,12 @@ project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
       display_PCy_oriented = root_display_y,
       root_inside_extant_convex_hull_displayed_2D = root_inside_hull,
       extant_centroid_distance_displayed_2D = root_centroid_distance,
+      extant_centroid_PCx_displayed_2D = centroid[[1]],
+      extant_centroid_PCy_displayed_2D = centroid[[2]],
       mahalanobis_distance_squared_from_extant_cloud_displayed_2D = root_md2,
       mahalanobis_distance_from_extant_cloud_displayed_2D = sqrt(root_md2),
+      mahalanobis_percentile_against_extant_distribution_displayed_2D = root_md_percentile,
+      mahalanobis_percentile_classification_displayed_2D = root_md_empirical_classification,
       extant_cloud_membership_status = cloud_status,
       extant_convex_hull_area_displayed_2D = extant_hull_area
     )
@@ -1422,7 +1545,11 @@ project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
     extant_hull_area = extant_hull_area,
     root_inside_hull = root_inside_hull,
     root_md2 = root_md2,
+    root_md_percentile = root_md_percentile,
+    root_md_empirical_classification = root_md_empirical_classification,
     root_cloud_status = cloud_status,
+    centroid = centroid,
+    extant_md2 = extant_md2,
     hull = tibble(x = hull_x, y = hull_y)
   )
 }
@@ -1476,6 +1603,91 @@ project_root_uncertainty_to_pca <- function(root_projection_table, pca_obj, root
   }
 
   list(ellipse = ell, cov = Sigma2, cov_info = cov_info)
+}
+
+interpolate_grid_value <- function(grid_x, grid_y, grid_z, x0, y0) {
+  if (!is.finite(x0) || !is.finite(y0)) return(NA_real_)
+
+  ix_hi <- findInterval(x0, grid_x) + 1
+  iy_hi <- findInterval(y0, grid_y) + 1
+  ix_hi <- min(max(ix_hi, 2), length(grid_x))
+  iy_hi <- min(max(iy_hi, 2), length(grid_y))
+  ix_lo <- ix_hi - 1
+  iy_lo <- iy_hi - 1
+
+  x_lo <- grid_x[ix_lo]
+  x_hi <- grid_x[ix_hi]
+  y_lo <- grid_y[iy_lo]
+  y_hi <- grid_y[iy_hi]
+
+  tx <- if (identical(x_hi, x_lo)) 0 else (x0 - x_lo) / (x_hi - x_lo)
+  ty <- if (identical(y_hi, y_lo)) 0 else (y0 - y_lo) / (y_hi - y_lo)
+
+  z11 <- grid_z[ix_lo, iy_lo]
+  z21 <- grid_z[ix_hi, iy_lo]
+  z12 <- grid_z[ix_lo, iy_hi]
+  z22 <- grid_z[ix_hi, iy_hi]
+
+  ((1 - tx) * (1 - ty) * z11) +
+    (tx * (1 - ty) * z21) +
+    ((1 - tx) * ty * z12) +
+    (tx * ty * z22)
+}
+
+compute_pca_density_diagnostics <- function(scores_out, root_point, grid_n = 160) {
+  x <- scores_out$display_PCx_oriented
+  y <- scores_out$display_PCy_oriented
+  root_x <- root_point$display_PCx_oriented[[1]]
+  root_y <- root_point$display_PCy_oriented[[1]]
+
+  x_pad <- 0.05 * diff(range(c(x, root_x), na.rm = TRUE))
+  y_pad <- 0.05 * diff(range(c(y, root_y), na.rm = TRUE))
+  if (!is.finite(x_pad) || x_pad <= 0) x_pad <- 1
+  if (!is.finite(y_pad) || y_pad <= 0) y_pad <- 1
+
+  dens <- MASS::kde2d(
+    x = x,
+    y = y,
+    n = grid_n,
+    lims = c(
+      min(c(x, root_x), na.rm = TRUE) - x_pad,
+      max(c(x, root_x), na.rm = TRUE) + x_pad,
+      min(c(y, root_y), na.rm = TRUE) - y_pad,
+      max(c(y, root_y), na.rm = TRUE) + y_pad
+    )
+  )
+
+  root_density <- interpolate_grid_value(dens$x, dens$y, dens$z, root_x, root_y)
+  extant_density <- mapply(
+    function(px, py) interpolate_grid_value(dens$x, dens$y, dens$z, px, py),
+    x,
+    y
+  )
+  density_percentile <- mean(extant_density <= root_density, na.rm = TRUE)
+  density_classification <- case_when(
+    !is.finite(density_percentile) ~ "unknown",
+    density_percentile >= 0.67 ~ "central",
+    density_percentile >= 0.33 ~ "marginal",
+    TRUE ~ "extreme"
+  )
+
+  surface_df <- expand.grid(
+    display_PCx_oriented = dens$x,
+    display_PCy_oriented = dens$y
+  ) %>%
+    as_tibble() %>%
+    mutate(
+      density = as.vector(dens$z),
+      density_scaled = density / max(density, na.rm = TRUE)
+    )
+
+  list(
+    root_density = root_density,
+    extant_density = extant_density,
+    density_percentile = density_percentile,
+    density_classification = density_classification,
+    density_surface = surface_df
+  )
 }
 
 # -----------------------------
@@ -1602,7 +1814,7 @@ write_interpretation_summary <- function(
   writeLines(lines, path)
 }
 
-make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_membership, eigenvalues, pca_obj) {
+make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_membership, eigenvalues, pca_obj, projection, density_surface) {
   arrow_mult <- 2.5
   thermal_arrows_df <- loadings %>%
     filter(variable %in% thermal_vars) %>%
@@ -1622,14 +1834,32 @@ make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_members
   var_pc2 <- percent(eigenvalues$variance_explained[pca_obj$display_pc_y], accuracy = 0.1)
   xlab_txt <- paste0("Thermal climatic gradient (PC", pca_obj$display_pc_x, ", ", var_pc1, ")")
   ylab_txt <- paste0("Precipitation climatic gradient (PC", pca_obj$display_pc_y, ", ", var_pc2, ")")
+  centroid_df <- tibble(
+    display_PCx_oriented = projection$centroid[[1]],
+    display_PCy_oriented = projection$centroid[[2]]
+  )
 
   p <- ggplot(scores_out, aes(x = display_PCx_oriented, y = display_PCy_oriented)) +
+    geom_raster(
+      data = density_surface,
+      aes(x = display_PCx_oriented, y = display_PCy_oriented, fill = density_scaled),
+      inherit.aes = FALSE,
+      alpha = 0.35,
+      interpolate = TRUE
+    ) +
     geom_polygon(
+      data = projection$hull,
+      aes(x = x, y = y),
+      inherit.aes = FALSE,
+      fill = NA,
+      color = "grey20",
+      linewidth = 0.5,
+      linetype = "dashed"
+    ) +
+    geom_path(
       data = ellipse_df,
-      aes(x = x, y = y, group = confidence_label, fill = confidence_label),
-      alpha = 0.16,
-      color = "black",
-      linewidth = 0.3,
+      aes(x = x, y = y, group = confidence_label, color = confidence_label),
+      linewidth = 0.55,
       inherit.aes = FALSE
     ) +
     geom_point(alpha = 0.28, size = 1.35, color = "grey35") +
@@ -1650,6 +1880,15 @@ make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_members
       fill = "red",
       color = "black",
       stroke = 0.5
+    ) +
+    geom_point(
+      data = centroid_df,
+      aes(x = display_PCx_oriented, y = display_PCy_oriented),
+      inherit.aes = FALSE,
+      shape = 4,
+      size = 3.8,
+      stroke = 0.9,
+      color = "black"
     ) +
     geom_segment(
       data = thermal_arrows_df,
@@ -1692,13 +1931,20 @@ make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_members
     ) +
     geom_hline(yintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey55") +
     geom_vline(xintercept = 0, linewidth = 0.3, linetype = "dashed", color = "grey55") +
-    scale_fill_manual(values = c("50%" = "#1b9e77", "80%" = "#d95f02", "95%" = "#7570b3")) +
+    scale_fill_gradient(
+      low = "grey98",
+      high = "#2c7fb8",
+      name = "Extant density"
+    ) +
+    scale_color_manual(
+      values = c("50%" = "#1b9e77", "80%" = "#d95f02", "95%" = "#7570b3"),
+      name = "Projected root CI"
+    ) +
     labs(
       x = xlab_txt,
       y = ylab_txt,
-      fill = "Projected root CI",
       title = "Result Block 1: ancestral climatic origin of the crown radiation",
-      subtitle = "Root reconstructed in original climate variables; PCA used only for visualization"
+      subtitle = "Root reconstructed in original climate variables; PCA, density, and hull used only for visualization"
     ) +
     theme_classic(base_size = 12)
 
@@ -1937,6 +2183,36 @@ if (using_named_downstream_model_set && !identical(pipeline_stage, "model_fit"))
       paste(unique(model_selection$best_overall_model[!model_selection$best_overall_model %in% expected_models]), collapse = ", ")
     )
   }
+
+  model_comparison_filtered <- named_downstream_inputs$model_comparison %>%
+    filter(.data$variable %in% climate_vars)
+
+  grouped_summary_filtered <- model_comparison_filtered %>%
+    group_by(.data$variable_type, .data$best_overall_model, .data$biological_mode_interpretation) %>%
+    summarise(
+      n_variables = dplyr::n(),
+      variables = paste(.data$variable, collapse = ", "),
+      robust_or_moderate_variables = sum(.data$winner_support %in% c("robust", "moderate"), na.rm = TRUE),
+      weak_variables = sum(.data$winner_support == "weak", na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  filtered_metadata_lines <- c(
+    paste0("stage=downstream_subset"),
+    paste0("source_model_set=", downstream_model_set),
+    paste0("analysis_output_label=", analysis_output_label),
+    paste0("climate_set=", climate_set),
+    paste0("variables_included=", paste(climate_vars, collapse = ",")),
+    paste0("n_variables=", length(climate_vars)),
+    paste0("OU_status=excluded_deferred"),
+    paste0("source_metadata_file=", basename(model_set_file_path("model_fit_metadata", ext = "txt", model_set_label = downstream_model_set)))
+  )
+
+  write_csv(model_fit_attempts, analysis_file_path("per_variable_model_fit_attempts"))
+  write_csv(model_selection, analysis_file_path("per_variable_model_selection"))
+  write_csv(model_comparison_filtered, analysis_file_path("per_variable_model_comparison"))
+  write_csv(grouped_summary_filtered, analysis_file_path("grouped_model_summary"))
+  writeLines(filtered_metadata_lines, analysis_file_path("model_fit_metadata", ext = "txt"))
 } else {
   message("Fitting or loading per-variable geiger::fitContinuous model fits.")
   message("Model-fit variable scope: ", paste(model_fit_variables, collapse = ", "))
@@ -2040,10 +2316,10 @@ if (reuse_named_root_reconstruction) {
     file.path(output_dir, "ancestral_root_original_climate_strict.csv"),
     "Existing root reconstruction table"
   )
-  named_root_output <- if (file.exists(model_set_file_path("ancestral_root_original_climate"))) {
+  named_root_output <- if (file.exists(analysis_file_path("ancestral_root_original_climate"))) {
     read_required_csv(
-      model_set_file_path("ancestral_root_original_climate"),
-      paste0("Existing named root output table for ", downstream_model_set)
+      analysis_file_path("ancestral_root_original_climate"),
+      paste0("Existing named root output table for ", analysis_output_label)
     )
   } else {
     NULL
@@ -2206,10 +2482,10 @@ if (reuse_named_root_reconstruction) {
   write_csv(per_variable_model_fits, file.path(output_dir, "per_variable_model_fits.csv"))
   write_csv(ancestral_root_original, file.path(output_dir, "ancestral_root_original_climate_strict.csv"))
   if (using_named_downstream_model_set) {
-    write_csv(named_root_output, model_set_file_path("ancestral_root_original_climate"))
+    write_csv(named_root_output, analysis_file_path("ancestral_root_original_climate"))
     write_csv(
       named_root_output %>% filter(!winning_model_used_for_reconstruction),
-      model_set_file_path("reconstruction_model_differences")
+      analysis_file_path("reconstruction_model_differences")
     )
   }
 
@@ -2335,6 +2611,14 @@ projected_root_point <- projection$root_point %>%
     .before = 1
   )
 
+density_diagnostics <- compute_pca_density_diagnostics(scores_out, projected_root_point)
+projected_root_point <- projected_root_point %>%
+  mutate(
+    density_at_root_displayed_2D = density_diagnostics$root_density,
+    density_percentile_against_extant_distribution_displayed_2D = density_diagnostics$density_percentile,
+    density_classification_displayed_2D = density_diagnostics$density_classification
+  )
+
 uncertainty_projection <- project_root_uncertainty_to_pca(
   root_projection_table,
   pca_obj,
@@ -2371,6 +2655,37 @@ core_membership <- scores_out %>%
 
 ellipse_95_ratio <- ellipse_df$ellipse_area_to_extant_hull_area_ratio[ellipse_df$confidence_level == 0.95][1]
 
+ancestral_core_diagnostics <- tibble(
+  analysis_output_label = analysis_output_label,
+  climate_set = climate_set,
+  model_universe = if_else(using_named_downstream_model_set, downstream_model_set, "standard_full_universe"),
+  n_variables = length(climate_vars),
+  OU_status = if_else(using_named_downstream_model_set, "excluded_deferred", "included_if_fit"),
+  root_display_PCx_oriented = projected_root_point$display_PCx_oriented[[1]],
+  root_display_PCy_oriented = projected_root_point$display_PCy_oriented[[1]],
+  extant_centroid_PCx_displayed_2D = projected_root_point$extant_centroid_PCx_displayed_2D[[1]],
+  extant_centroid_PCy_displayed_2D = projected_root_point$extant_centroid_PCy_displayed_2D[[1]],
+  root_inside_extant_convex_hull_displayed_2D = projection$root_inside_hull,
+  root_mahalanobis_distance_squared_displayed_2D = projection$root_md2,
+  root_mahalanobis_distance_displayed_2D = sqrt(projection$root_md2),
+  root_mahalanobis_percentile_against_extant_distribution_displayed_2D = projection$root_md_percentile,
+  root_mahalanobis_classification_displayed_2D = projection$root_md_empirical_classification,
+  root_density_displayed_2D = density_diagnostics$root_density,
+  root_density_percentile_against_extant_distribution_displayed_2D = density_diagnostics$density_percentile,
+  root_density_classification_displayed_2D = density_diagnostics$density_classification,
+  root_extant_cloud_status_displayed_2D = projection$root_cloud_status,
+  extant_convex_hull_area_displayed_2D = projection$extant_hull_area,
+  ellipse_95_area_to_extant_hull_area_ratio = ellipse_95_ratio,
+  root_overall_displayed_space_classification = case_when(
+    !projection$root_inside_hull ~ "extreme",
+    projection$root_md_percentile > 0.95 ~ "extreme",
+    density_diagnostics$density_percentile < 0.10 ~ "extreme",
+    projection$root_md_percentile > 0.50 ~ "marginal",
+    density_diagnostics$density_percentile < 0.33 ~ "marginal",
+    TRUE ~ "central"
+  )
+)
+
 interpretability_metrics <- tibble(
   number_of_usable_primary_variables = sum(ancestral_root_original$contributes_to_main_root_estimate),
   proportion_of_variables_with_caution_flags = mean(ancestral_root_original$interpretability_flag != "none"),
@@ -2388,11 +2703,18 @@ interpretability_metrics <- tibble(
   number_of_variables_where_root_outside_extant_range = sum(!ancestral_root_original$root_lies_within_extant_observed_range, na.rm = TRUE),
   root_mahalanobis_distance_squared_in_PCA_space = projection$root_md2,
   root_mahalanobis_distance_in_PCA_space = sqrt(projection$root_md2),
+  root_mahalanobis_percentile_against_extant_distribution = projection$root_md_percentile,
+  root_mahalanobis_percentile_classification = projection$root_md_empirical_classification,
+  root_density_in_PCA_space = density_diagnostics$root_density,
+  root_density_percentile_against_extant_distribution = density_diagnostics$density_percentile,
+  root_density_classification = density_diagnostics$density_classification,
   extant_cloud_membership = projection$root_cloud_status,
   root_inside_extant_convex_hull_displayed_2D = projection$root_inside_hull,
   ellipse_95_area_to_extant_hull_area_ratio = ellipse_95_ratio,
   covariance_condition_number = uncertainty_projection$cov_info$condition_number,
   covariance_used_nearPD = uncertainty_projection$cov_info$used_near_pd,
+  climate_set = climate_set,
+  analysis_output_label = analysis_output_label,
   model_universe = if_else(using_named_downstream_model_set, downstream_model_set, "standard_full_universe"),
   OU_status = if_else(using_named_downstream_model_set, "excluded_deferred", "included_if_fit")
 )
@@ -2405,6 +2727,7 @@ write_csv(projected_root_point, file.path(output_dir, "ancestral_root_projected_
 write_csv(ellipse_df, file.path(output_dir, "ancestral_root_projected_PCA_ellipses_strict.csv"))
 write_csv(core_membership, file.path(output_dir, "species_membership_in_projected_root_ellipses_strict.csv"))
 write_csv(interpretability_metrics, file.path(output_dir, "ancestral_root_interpretability_metrics.csv"))
+write_csv(ancestral_core_diagnostics, analysis_file_path("ancestral_core_diagnostics"))
 write_csv(
   tibble(warning = if (length(pipeline_warnings) == 0) "none" else unique(pipeline_warnings)),
   file.path(output_dir, "pipeline_warnings_and_safeguards.csv")
@@ -2420,9 +2743,9 @@ write_interpretation_summary(
 )
 
 if (using_named_downstream_model_set) {
-  write_csv(projected_root_point, model_set_file_path("ancestral_root_projected_PCA_point"))
-  write_csv(ellipse_df, model_set_file_path("ancestral_root_projected_PCA_ellipses"))
-  write_csv(interpretability_metrics, model_set_file_path("ancestral_root_interpretability_metrics"))
+  write_csv(projected_root_point, analysis_file_path("ancestral_root_projected_PCA_point"))
+  write_csv(ellipse_df, analysis_file_path("ancestral_root_projected_PCA_ellipses"))
+  write_csv(interpretability_metrics, analysis_file_path("ancestral_root_interpretability_metrics"))
 
   named_fallback_vars <- ancestral_root_original$variable[
     !mapply(
@@ -2441,12 +2764,45 @@ if (using_named_downstream_model_set) {
     filter(.data$variable %in% precip_vars) %>%
     transmute(line = paste0(.data$variable, "=", .data$root_position_relative_to_extant_distribution)) %>%
     pull(line)
+  thermal_root_values <- named_root_output %>%
+    filter(.data$variable %in% thermal_vars) %>%
+    transmute(line = paste0(
+      .data$variable,
+      ": root=", signif(.data$root_estimate, 5),
+      " [", signif(.data$CI_low, 5), ", ", signif(.data$CI_high, 5), "]"
+    )) %>%
+    pull(line)
+  precipitation_root_values <- named_root_output %>%
+    filter(.data$variable %in% precip_vars) %>%
+    transmute(line = paste0(
+      .data$variable,
+      ": root=", signif(.data$root_estimate, 5),
+      " [", signif(.data$CI_low, 5), ", ", signif(.data$CI_high, 5), "]"
+    )) %>%
+    pull(line)
+  thermal_consistency_line <- if (all(grepl("^.+central_within_extant_distribution$", thermal_positions))) {
+    "Thermal variables are consistently central within extant thermal distributions."
+  } else {
+    paste0(
+      "Thermal variables show mixed placement: ",
+      paste(thermal_positions, collapse = "; ")
+    )
+  }
+  precipitation_consistency_line <- if (all(grepl("^.+central_within_extant_distribution$", precipitation_positions))) {
+    "Precipitation variables are consistently central within extant precipitation distributions."
+  } else {
+    paste0(
+      "Precipitation variables show mixed placement: ",
+      paste(precipitation_positions, collapse = "; ")
+    )
+  }
 
   writeLines(
     c(
-      "Result Block 1 root interpretation summary (5models_no_OU)",
-      "========================================================",
+      paste0("Result Block 1 root interpretation summary (", analysis_output_label, ")"),
+      paste(rep("=", nchar(paste0("Result Block 1 root interpretation summary (", analysis_output_label, ")"))), collapse = ""),
       "",
+      paste0("Climate set: ", climate_set),
       "Model universe:",
       "BM, EB, lambda, delta, and mean_trend.",
       "OU was excluded/deferred because full-tree OU fitting remained computationally intractable under the available compute setup.",
@@ -2457,7 +2813,7 @@ if (using_named_downstream_model_set) {
       paste0(
         "All ",
         nrow(ancestral_root_original),
-        " variables selected lambda within the five-model/no-OU universe."
+        " variables in this climate set selected lambda within the five-model/no-OU universe."
       ),
       paste0(
         "Downstream ancestral reconstruction used lambda_fastAnc for ",
@@ -2466,16 +2822,29 @@ if (using_named_downstream_model_set) {
       ),
       "",
       paste0("Projected root status in displayed PCA space: ", projection$root_cloud_status),
+      paste0("Overall displayed-space classification: ", ancestral_core_diagnostics$root_overall_displayed_space_classification[[1]]),
       paste0("Projected root inside displayed extant convex hull: ", projection$root_inside_hull),
       paste0("Projected root Mahalanobis distance squared: ", signif(projection$root_md2, 4)),
+      paste0("Projected root Mahalanobis percentile against extant distribution: ", percent(projection$root_md_percentile, accuracy = 0.1)),
+      paste0("Projected root Mahalanobis classification: ", projection$root_md_empirical_classification),
+      paste0("Projected root density percentile against extant distribution: ", percent(density_diagnostics$density_percentile, accuracy = 0.1)),
+      paste0("Projected root density classification: ", density_diagnostics$density_classification),
       paste0("95% ellipse / extant convex hull area ratio: ", signif(ellipse_95_ratio, 4)),
       paste0("Variables where reconstruction differed from the winning model: ", interpretability_metrics$number_of_variables_where_reconstruction_differs_from_best_model),
       "",
+      "Thermal root values in original variables:",
+      if (length(thermal_root_values) == 0) "none" else paste(thermal_root_values, collapse = "\n"),
+      "",
+      "Precipitation root values in original variables:",
+      if (length(precipitation_root_values) == 0) "none" else paste(precipitation_root_values, collapse = "\n"),
+      "",
       "Thermal variable root positions relative to extant distributions:",
       if (length(thermal_positions) == 0) "none" else paste(thermal_positions, collapse = "\n"),
+      thermal_consistency_line,
       "",
       "Precipitation variable root positions relative to extant distributions:",
       if (length(precipitation_positions) == 0) "none" else paste(precipitation_positions, collapse = "\n"),
+      precipitation_consistency_line,
       "",
       "Variables with robust root estimates:",
       if (length(robust_root_vars) == 0) "none" else paste(robust_root_vars, collapse = ", "),
@@ -2491,15 +2860,17 @@ if (using_named_downstream_model_set) {
       "",
       "Important limitation:",
       "This is a five-model/no-OU Result Block 1 analysis, not the final six-model universe.",
-      "Do not describe PCA as the inferential basis of ancestral reconstruction."
+      "Do not describe PCA as the inferential basis of ancestral reconstruction.",
+      "Do not describe the projected ellipse as a fully jointly inferred multivariate ancestral niche."
     ),
-    model_set_file_path("biological_interpretation_summary_root", ext = "txt")
+    analysis_file_path("biological_interpretation_summary_root", ext = "txt")
   )
 
   readme_lines <- c(
-    "Result Block 1 downstream readme (5models_no_OU)",
-    "===============================================",
+    paste0("Result Block 1 downstream readme (", analysis_output_label, ")"),
+    paste(rep("=", nchar(paste0("Result Block 1 downstream readme (", analysis_output_label, ")"))), collapse = ""),
     "",
+    paste0("Climate set: ", climate_set),
     "Model universe used:",
     "BM, EB, lambda, delta, mean_trend.",
     "OU status: excluded/deferred, not unsupported.",
@@ -2509,16 +2880,18 @@ if (using_named_downstream_model_set) {
     "The completed five-model/no-OU model-fit aggregation is therefore the explicit downstream model universe for this run.",
     "",
     "How to interpret these outputs:",
-    "1. ancestral_root_original_climate_5models_no_OU.csv is the per-variable ancestral reconstruction in original climate variables.",
-    "2. ancestral_root_projected_PCA_point_5models_no_OU.csv and ancestral_root_projected_PCA_ellipses_5models_no_OU.csv are visualization/diagnostic projections only.",
-    "3. ancestral_climatic_core_plot_5models_no_OU.* is a figure derived from the projected root, not the inferential basis of reconstruction.",
-    "4. biological_interpretation_summary_root_5models_no_OU.txt is the manuscript-facing summary for this five-model/no-OU Result Block 1 run.",
-    "5. In this completed five-model/no-OU run, all 12 variables selected lambda and downstream reconstruction used lambda_fastAnc.",
+    paste0("1. ancestral_root_original_climate_", analysis_output_label, ".csv is the per-variable ancestral reconstruction in original climate variables."),
+    paste0("2. ancestral_root_projected_PCA_point_", analysis_output_label, ".csv and ancestral_root_projected_PCA_ellipses_", analysis_output_label, ".csv are visualization/diagnostic projections only."),
+    paste0("3. ancestral_climatic_core_plot_", analysis_output_label, ".* is a figure derived from the projected root, not the inferential basis of reconstruction."),
+    paste0("4. ancestral_core_diagnostics_", analysis_output_label, ".csv contains convex-hull, Mahalanobis, and density diagnostics."),
+    paste0("5. biological_interpretation_summary_root_", analysis_output_label, ".txt is the manuscript-facing summary for this climate-set-specific Result Block 1 run."),
+    paste0("6. In this completed run, all ", nrow(ancestral_root_original), " variables selected lambda and downstream reconstruction used lambda_fastAnc."),
     "",
     "What should not be claimed:",
     "- Do not describe this as a six-model result.",
     "- Do not describe PCA as ancestral inference.",
     "- Do not treat OU as rejected; it was excluded/deferred for operational reasons.",
+    "- Do not overinterpret the projected ellipse as a true multivariate ancestral niche.",
     "",
     "Upstream model-fit provenance:",
     named_downstream_inputs$metadata_lines,
@@ -2526,7 +2899,7 @@ if (using_named_downstream_model_set) {
     "Upstream five-model biological summary:",
     named_downstream_inputs$biological_summary_lines
   )
-  writeLines(readme_lines, model_set_file_path("result_block_1_readme", ext = "txt"))
+  writeLines(readme_lines, analysis_file_path("result_block_1_readme", ext = "txt"))
 }
 
 writeLines(
@@ -2594,18 +2967,20 @@ if (!skip_plots && pipeline_stage %in% c("all", "plot")) {
     loadings = pca_obj$loadings,
     core_membership = core_membership,
     eigenvalues = pca_obj$eigenvalues,
-    pca_obj = pca_obj
+    pca_obj = pca_obj,
+    projection = projection,
+    density_surface = density_diagnostics$density_surface
   )
 
   if (using_named_downstream_model_set) {
     file.copy(
       file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.png"),
-      model_set_file_path("ancestral_climatic_core_plot", ext = "png"),
+      analysis_file_path("ancestral_climatic_core_plot", ext = "png"),
       overwrite = TRUE
     )
     file.copy(
       file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.pdf"),
-      model_set_file_path("ancestral_climatic_core_plot", ext = "pdf"),
+      analysis_file_path("ancestral_climatic_core_plot", ext = "pdf"),
       overwrite = TRUE
     )
   }

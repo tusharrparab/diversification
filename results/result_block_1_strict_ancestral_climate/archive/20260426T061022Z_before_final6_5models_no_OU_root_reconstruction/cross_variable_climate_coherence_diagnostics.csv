@@ -1,0 +1,6 @@
+rule_id,variables_involved,screen_result,explanation
+thermal_mean_vs_cold_quarter,annual_mean_temperature; mean_temperature_coldest_quarter; temperature_annual_range,no_strong_contradiction_detected,Warm annual mean but cold quarter without high annual range is biologically difficult to interpret.
+thermal_max_vs_min,maximum_temperature_warmest_month; minimum_temperature_coldest_month; temperature_annual_range,no_strong_contradiction_detected,Hot warmest month and cold coldest month should usually coincide with high annual range.
+temperature_seasonality_vs_range,temperature_seasonality; temperature_annual_range,no_strong_contradiction_detected,Temperature seasonality and annual range are expected to broadly agree.
+annual_precip_vs_wettest_quarter,annual_precipitation; precipitation_of_wettest_quarter; precipitation_wettest_month,no_strong_contradiction_detected,Annual precipitation should broadly agree with wettest-period precipitation unless precipitation is highly seasonal.
+cold_quarter_precip_duplicate_check,precipitation_in_coldest_quarter; precipitation_of_coldest_quarter,no_strong_contradiction_detected,These two cold-quarter precipitation variables should not strongly disagree if they represent the same biology.

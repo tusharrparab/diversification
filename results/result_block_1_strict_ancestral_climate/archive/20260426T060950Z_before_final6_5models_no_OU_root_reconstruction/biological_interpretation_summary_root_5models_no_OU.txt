@@ -1,0 +1,50 @@
+Result Block 1 root interpretation summary (5models_no_OU)
+========================================================
+
+Model universe:
+BM, EB, lambda, delta, and mean_trend.
+OU was excluded/deferred because full-tree OU fitting remained computationally intractable under the available compute setup.
+
+Core method statement:
+Ancestral climate was reconstructed in the original climate variables.
+PCA was used only to project the reconstructed root for visualization and diagnostics.
+All 12 variables selected lambda within the five-model/no-OU universe.
+Downstream ancestral reconstruction used lambda_fastAnc for 12 variable(s).
+
+Projected root status in displayed PCA space: central
+Projected root inside displayed extant convex hull: TRUE
+Projected root Mahalanobis distance squared: 0.1146
+95% ellipse / extant convex hull area ratio: 0.09084
+Variables where reconstruction differed from the winning model: 0
+
+Thermal variable root positions relative to extant distributions:
+annual_mean_temperature=central_within_extant_distribution
+maximum_temperature_warmest_month=central_within_extant_distribution
+mean_temperature_coldest_quarter=central_within_extant_distribution
+mean_temperature_driest_quarter=central_within_extant_distribution
+minimum_temperature_coldest_month=central_within_extant_distribution
+temperature_annual_range=central_within_extant_distribution
+temperature_seasonality=central_within_extant_distribution
+
+Precipitation variable root positions relative to extant distributions:
+annual_precipitation=central_within_extant_distribution
+precipitation_in_coldest_quarter=central_within_extant_distribution
+precipitation_of_coldest_quarter=central_within_extant_distribution
+precipitation_of_wettest_quarter=central_within_extant_distribution
+precipitation_wettest_month=central_within_extant_distribution
+
+Variables with robust root estimates:
+annual_mean_temperature, annual_precipitation, maximum_temperature_warmest_month, mean_temperature_coldest_quarter, mean_temperature_driest_quarter, minimum_temperature_coldest_month, precipitation_in_coldest_quarter, precipitation_of_coldest_quarter, precipitation_of_wettest_quarter, precipitation_wettest_month, temperature_annual_range, temperature_seasonality
+
+Variables with fragile or flagged root estimates:
+none
+
+Variables requiring fallback reconstruction:
+none
+
+Warnings raised during this downstream run:
+none
+
+Important limitation:
+This is a five-model/no-OU Result Block 1 analysis, not the final six-model universe.
+Do not describe PCA as the inferential basis of ancestral reconstruction.

@@ -1,0 +1,41 @@
+Result Block 1 biological interpretation summary
+=================================================
+
+Question: Where did the radiation begin in climatic space?
+
+Core method statement:
+Ancestral climate was reconstructed in the original environmental variables after per-variable evolutionary model fitting.
+PCA was used only to visualize extant climatic structure and the projected ancestral root.
+Variables whose best-supported model fell outside the primary reconstructable model set were retained as sensitivity cases and explicitly flagged.
+
+Final classification: ROBUST
+Usable primary variables: 12 of 12
+Variables with OU/EB/mean_trend as best overall model: 0
+Variables with caution flags: 0
+Median primary delta AICc from best model: 0
+Variables where root is outside extant range: 0
+Projected root cloud status: central
+Projected root Mahalanobis distance squared: 0.1146
+95% ellipse / extant convex hull area ratio: 0.09084
+
+Robust variables:
+annual_mean_temperature, annual_precipitation, maximum_temperature_warmest_month, mean_temperature_coldest_quarter, mean_temperature_driest_quarter, minimum_temperature_coldest_month, precipitation_in_coldest_quarter, precipitation_of_coldest_quarter, precipitation_of_wettest_quarter, precipitation_wettest_month, temperature_annual_range, temperature_seasonality
+
+Tentative variables:
+none
+
+Fragile variables:
+none
+
+Cross-variable coherence screen:
+No strong rule-based contradictions detected.
+
+Sensitivity cases:
+No sensitivity-only model won AICc.
+
+Warnings raised during run:
+none
+
+Important limitation:
+The projected root ellipse is an uncertainty projection from per-variable estimates using a diagonal covariance approximation.
+It should not be described as a fully jointly inferred multivariate ancestral climatic niche.

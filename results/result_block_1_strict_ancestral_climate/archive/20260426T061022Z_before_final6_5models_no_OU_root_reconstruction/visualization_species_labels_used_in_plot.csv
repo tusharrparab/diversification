@@ -1,0 +1,16 @@
+species_original,species_clean,tree_label,display_PCx_oriented,display_PCy_oriented,mahalanobis_d2_to_projected_root_uncertainty,inside_50_projected_root_ellipse,inside_80_projected_root_ellipse,inside_95_projected_root_ellipse,closest_projected_root_ellipse_level
+Zosterops poliogastrus,zosterops poliogastrus,zosterops_poliogastrus,-0.31586559719125507,-0.27115426675775695,3.0289524422905193e-4,TRUE,TRUE,TRUE,50%
+Dicrurus adsimilis,dicrurus adsimilis,dicrurus_adsimilis,-0.31365850118733035,-0.2681925262886219,3.3235230666371727e-4,TRUE,TRUE,TRUE,50%
+Glaucidium perlatum,glaucidium perlatum,glaucidium_perlatum,-0.33781783345749045,-0.28120594466108395,6.176670896167672e-4,TRUE,TRUE,TRUE,50%
+Saltator cinctus,saltator cinctus,saltator_cinctus,-0.34152025662653446,-0.28677265233905574,0.001129156263496398,TRUE,TRUE,TRUE,50%
+Ardea melanocephala,ardea melanocephala,ardea_melanocephala,-0.31032884483153933,-0.2851638921453858,0.0013594000719774062,TRUE,TRUE,TRUE,50%
+Heliangelus clarisse,heliangelus clarisse,heliangelus_clarisse,-0.33084586775748354,-0.23734299044401225,0.0016058450275158774,TRUE,TRUE,TRUE,50%
+Serinus nigriceps,serinus nigriceps,serinus_nigriceps,-0.3200369435902396,-0.23095618168886212,0.0023473110932236948,TRUE,TRUE,TRUE,50%
+Apus affinis,apus affinis,apus_affinis,-0.2954167949129666,-0.2827859405360592,0.0024312983562497915,TRUE,TRUE,TRUE,50%
+Rhinoptilus bitorquatus,rhinoptilus bitorquatus,rhinoptilus_bitorquatus,-0.2911831052328751,-0.243252944312174,0.0028066823102323372,TRUE,TRUE,TRUE,50%
+Coracias naevius,coracias naevius,coracias_naevius,-0.30269585088245626,-0.296580218263536,0.0031712756963545746,TRUE,TRUE,TRUE,50%
+Caprimulgus fraenatus,caprimulgus fraenatus,caprimulgus_fraenatus,-0.28692364961180966,-0.2884905750934735,0.004004618152997635,TRUE,TRUE,TRUE,50%
+Myiothlypis luteoviridis,myiothlypis luteoviridis,myiothlypis_luteoviridis,-0.2785458961204752,-0.2861348397325444,0.005027113157659759,TRUE,TRUE,TRUE,50%
+Nilaus afer,nilaus afer,nilaus_afer,-0.282420480590852,-0.23020822973181898,0.005168686687995472,TRUE,TRUE,TRUE,50%
+Tangara cyanocephala,tangara cyanocephala,tangara_cyanocephala,-0.36961604270285403,-0.23389591341958677,0.005264036343960419,TRUE,TRUE,TRUE,50%
+Melierax metabates,melierax metabates,melierax_metabates,-0.2741276916362581,-0.23537965434527094,0.0058038725335683335,TRUE,TRUE,TRUE,50%

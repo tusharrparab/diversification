@@ -1,0 +1,3 @@
+variable_type,best_overall_model,biological_mode_interpretation,n_variables,variables,robust_or_moderate_variables,weak_variables
+precipitation,lambda,strong phylogenetic structure / signal,3,"annual_precipitation, precipitation_of_coldest_quarter, precipitation_of_wettest_quarter",3,0
+thermal,lambda,strong phylogenetic structure / signal,3,"annual_mean_temperature, minimum_temperature_coldest_month, temperature_seasonality",3,0

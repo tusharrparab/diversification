@@ -1,0 +1,63 @@
+Result Block 1 root interpretation summary (final6_5models_no_OU)
+=================================================================
+
+Climate set: final_6_variable_core
+Model universe:
+BM, EB, lambda, delta, and mean_trend.
+OU was excluded/deferred because full-tree OU fitting remained computationally intractable under the available compute setup.
+
+Core method statement:
+Ancestral climate was reconstructed in the original climate variables.
+PCA was used only to project the reconstructed root for visualization and diagnostics.
+All 6 variables in this climate set selected lambda within the five-model/no-OU universe.
+Downstream ancestral reconstruction used lambda_fastAnc for 6 variable(s).
+
+Projected root status in displayed PCA space: central
+Overall displayed-space classification: central
+Projected root inside displayed extant convex hull: TRUE
+Projected root Mahalanobis distance squared: 0.1071
+Projected root Mahalanobis percentile against extant distribution: 9.3%
+Projected root Mahalanobis classification: central
+Projected root density percentile against extant distribution: 88.9%
+Projected root density classification: central
+95% ellipse / extant convex hull area ratio: 0.6453
+Variables where reconstruction differed from the winning model: 0
+
+Thermal root values in original variables:
+annual_mean_temperature: root=207.16 [92.329, 321.98]
+minimum_temperature_coldest_month: root=124.44 [-57.21, 306.09]
+temperature_seasonality: root=2649.4 [-2303.7, 7602.6]
+
+Precipitation root values in original variables:
+annual_precipitation: root=1340.1 [-186.24, 2866.5]
+precipitation_of_coldest_quarter: root=282.31 [-103.78, 668.4]
+precipitation_of_wettest_quarter: root=590.85 [35.954, 1145.8]
+
+Thermal variable root positions relative to extant distributions:
+annual_mean_temperature=central_within_extant_distribution
+minimum_temperature_coldest_month=central_within_extant_distribution
+temperature_seasonality=central_within_extant_distribution
+Thermal variables are consistently central within extant thermal distributions.
+
+Precipitation variable root positions relative to extant distributions:
+annual_precipitation=central_within_extant_distribution
+precipitation_of_coldest_quarter=central_within_extant_distribution
+precipitation_of_wettest_quarter=central_within_extant_distribution
+Precipitation variables are consistently central within extant precipitation distributions.
+
+Variables with robust root estimates:
+annual_mean_temperature, annual_precipitation, minimum_temperature_coldest_month, precipitation_of_coldest_quarter, precipitation_of_wettest_quarter, temperature_seasonality
+
+Variables with fragile or flagged root estimates:
+none
+
+Variables requiring fallback reconstruction:
+none
+
+Warnings raised during this downstream run:
+none
+
+Important limitation:
+This is a five-model/no-OU Result Block 1 analysis, not the final six-model universe.
+Do not describe PCA as the inferential basis of ancestral reconstruction.
+Do not describe the projected ellipse as a fully jointly inferred multivariate ancestral niche.
