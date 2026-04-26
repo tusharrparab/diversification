@@ -675,6 +675,37 @@ variance_from_ci <- function(ci_low, ci_high) {
   ((ci_high - ci_low) / (2 * stats::qnorm(0.975)))^2
 }
 
+extract_root_variance <- function(ace_like_obj, tree) {
+  root_node <- as.character(Ntip(tree) + 1)
+  var_vals <- ace_like_obj$var
+  if (is.null(var_vals)) return(NA_real_)
+
+  if (is.matrix(var_vals)) {
+    if (!is.null(rownames(var_vals)) && root_node %in% rownames(var_vals)) {
+      out <- suppressWarnings(as.numeric(var_vals[root_node, 1]))
+      if (length(out) == 1 && is.finite(out)) return(out)
+    }
+    out <- suppressWarnings(as.numeric(var_vals[1, 1]))
+    if (length(out) == 1 && is.finite(out)) return(out)
+  }
+
+  if (!is.null(names(var_vals)) && root_node %in% names(var_vals)) {
+    out <- suppressWarnings(as.numeric(var_vals[root_node]))
+    if (length(out) == 1 && is.finite(out)) return(out)
+  }
+
+  out <- suppressWarnings(as.numeric(var_vals[1]))
+  if (length(out) == 1 && is.finite(out)) return(out)
+  NA_real_
+}
+
+reconstruction_uses_winning_model <- function(best_model, reconstruction_model) {
+  if (!is.character(best_model) || !is.character(reconstruction_model)) return(FALSE)
+  if (length(best_model) != 1 || length(reconstruction_model) != 1) return(FALSE)
+  if (is.na(best_model) || is.na(reconstruction_model)) return(FALSE)
+  identical(best_model, reconstruction_model) || startsWith(reconstruction_model, paste0(best_model, "_"))
+}
+
 transform_tree_for_primary_model <- function(tree, fit_obj, primary_model, parameter_summary = NA_character_) {
   if (primary_model == "BM") {
     return(list(tree = tree, transform_parameter = NA_real_, transform_status = "not_applicable"))
@@ -711,9 +742,88 @@ transform_tree_for_primary_model <- function(tree, fit_obj, primary_model, param
   stop("Unsupported primary reconstruction model: ", primary_model)
 }
 
+reconstruct_lambda_fastAnc <- function(tree, trait_vec, lambda_value, variable) {
+  if (!is.finite(lambda_value) || lambda_value < 0 || lambda_value > 1) {
+    stop("lambda_fastAnc requires a finite lambda in [0, 1]. Got: ", lambda_value)
+  }
+
+  recon_tree <- geiger::lambdaTree(tree, lambda = lambda_value)
+  trait_reordered <- trait_vec[recon_tree$tip.label]
+  if (any(!is.finite(trait_reordered))) {
+    stop("Trait vector contains non-finite values after lambda tree reordering")
+  }
+
+  fast_fit <- phytools::fastAnc(
+    tree = recon_tree,
+    x = trait_reordered,
+    vars = TRUE,
+    CI = TRUE
+  )
+
+  root_estimate <- extract_root_value(fast_fit, recon_tree)
+  ci <- extract_root_ci(fast_fit, recon_tree)
+  root_variance <- extract_root_variance(fast_fit, recon_tree)
+  if (!is.finite(root_variance)) {
+    root_variance <- variance_from_ci(ci[1], ci[2])
+  }
+
+  tibble(
+    variable = variable,
+    reconstruction_model = "lambda_fastAnc",
+    transform_parameter = lambda_value,
+    transform_status = "lambdaTree_fastAnc",
+    root_estimate = root_estimate,
+    root_variance = root_variance,
+    root_variance_source = case_when(
+      is.finite(extract_root_variance(fast_fit, recon_tree)) ~ "fastAnc_root_variance",
+      is.finite(root_variance) ~ "CI95_width_assuming_normality",
+      TRUE ~ "unavailable"
+    ),
+    CI_low = ci[1],
+    CI_high = ci[2],
+    reconstruction_status = if_else(
+      is.finite(root_estimate) & is.finite(ci[1]) & is.finite(ci[2]),
+      "ok",
+      "ok_root_variance_unavailable"
+    ),
+    reconstruction_error = NA_character_,
+    reconstruction_fallback_reason = NA_character_
+  )
+}
+
 reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_obj = NULL, parameter_summary = NA_character_) {
   tryCatch(
     {
+      if (primary_model == "lambda") {
+        lambda_value <- extract_fit_parameter(fit_obj, c("lambda"))
+        if (!is.finite(lambda_value)) {
+          lambda_value <- extract_parameter_from_summary(parameter_summary, "lambda")
+        }
+
+        fastanc_attempt <- tryCatch(
+          reconstruct_lambda_fastAnc(
+            tree = tree,
+            trait_vec = trait,
+            lambda_value = lambda_value,
+            variable = variable
+          ),
+          error = function(e) e
+        )
+
+        if (!inherits(fastanc_attempt, "error")) {
+          return(fastanc_attempt)
+        }
+
+        fallback_reason <- paste0(
+          "lambda_fastAnc_failed: ",
+          conditionMessage(fastanc_attempt),
+          "; falling back to lambda_ace"
+        )
+        add_pipeline_warning(paste0("Lambda fastAnc fallback for ", variable, ": ", conditionMessage(fastanc_attempt)))
+      } else {
+        fallback_reason <- NA_character_
+      }
+
       tree_info <- transform_tree_for_primary_model(
         tree,
         fit_obj = fit_obj,
@@ -741,7 +851,7 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
 
       tibble(
         variable = variable,
-        reconstruction_model = primary_model,
+        reconstruction_model = if_else(primary_model == "lambda", "lambda_ace_fallback", primary_model),
         transform_parameter = tree_info$transform_parameter,
         transform_status = tree_info$transform_status,
         root_estimate = extract_root_value(ace_fit, recon_tree),
@@ -758,7 +868,8 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
           "ok",
           "ok_root_variance_unavailable"
         ),
-        reconstruction_error = NA_character_
+        reconstruction_error = NA_character_,
+        reconstruction_fallback_reason = fallback_reason
       )
     },
     error = function(e) {
@@ -773,7 +884,8 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
         CI_low = NA_real_,
         CI_high = NA_real_,
         reconstruction_status = "failed",
-        reconstruction_error = conditionMessage(e)
+        reconstruction_error = conditionMessage(e),
+        reconstruction_fallback_reason = NA_character_
       )
     }
   )
@@ -989,7 +1101,7 @@ classify_variable_interpretability <- function(
 ) {
   flags <- c()
   if (!identical(reconstruction_status, "ok")) flags <- c(flags, "primary_reconstruction_uncertain")
-  if (!is.na(best_overall_model) && !is.na(reconstruction_model) && best_overall_model != reconstruction_model) {
+  if (!reconstruction_uses_winning_model(best_overall_model, reconstruction_model)) {
     flags <- c(flags, "best_model_not_used_for_reconstruction")
   }
   if (is.finite(primary_delta_from_best) && primary_delta_from_best > primary_delta_warning) {
@@ -1371,7 +1483,10 @@ project_root_uncertainty_to_pca <- function(root_projection_table, pca_obj, root
 # -----------------------------
 build_sensitivity_comparison <- function(root_table) {
   root_table %>%
-    filter(best_overall_model %in% sensitivity_models, best_overall_model != reconstruction_model) %>%
+    filter(
+      best_overall_model %in% sensitivity_models,
+      !mapply(reconstruction_uses_winning_model, best_overall_model, reconstruction_model)
+    ) %>%
     transmute(
       variable,
       best_overall_model,
@@ -1906,6 +2021,20 @@ reuse_named_root_reconstruction <- using_named_downstream_model_set &&
   file.exists(file.path(output_dir, "ancestral_root_original_climate_strict.csv"))
 
 if (reuse_named_root_reconstruction) {
+  existing_root_check <- tryCatch(
+    read_required_csv(
+      file.path(output_dir, "ancestral_root_original_climate_strict.csv"),
+      "Existing root reconstruction table"
+    ),
+    error = function(e) NULL
+  )
+  reuse_named_root_reconstruction <- !is.null(existing_root_check) &&
+    nrow(existing_root_check) == length(climate_vars) &&
+    sum(is.finite(existing_root_check$root_estimate)) >= length(climate_vars) - 1 &&
+    sum(is.finite(existing_root_check$root_variance) & existing_root_check$root_variance > 0) >= 2
+}
+
+if (reuse_named_root_reconstruction) {
   message("Reusing previously written named-set root reconstruction outputs.")
   ancestral_root_original <- read_required_csv(
     file.path(output_dir, "ancestral_root_original_climate_strict.csv"),
@@ -2039,7 +2168,11 @@ if (reuse_named_root_reconstruction) {
         variable,
         best_model_5models_no_OU = best_overall_model,
         reconstruction_model_used = reconstruction_model,
-        winning_model_used_for_reconstruction = best_overall_model == reconstruction_model,
+        winning_model_used_for_reconstruction = mapply(
+          reconstruction_uses_winning_model,
+          best_overall_model,
+          reconstruction_model
+        ),
         reconstruction_fallback_reason = if_else(
           is.na(reconstruction_fallback_reason) | reconstruction_fallback_reason == "",
           "none",
@@ -2095,7 +2228,11 @@ if (reuse_named_root_reconstruction) {
   }
 
   fallback_prop <- mean(
-    ancestral_root_original$best_overall_model != ancestral_root_original$reconstruction_model,
+    !mapply(
+      reconstruction_uses_winning_model,
+      ancestral_root_original$best_overall_model,
+      ancestral_root_original$reconstruction_model
+    ),
     na.rm = TRUE
   )
   if (using_named_downstream_model_set && is.finite(fallback_prop) && fallback_prop > 0.25) {
@@ -2241,7 +2378,11 @@ interpretability_metrics <- tibble(
   median_primary_delta_from_best = median(ancestral_root_original$primary_delta_from_best, na.rm = TRUE),
   number_of_variables_with_non_primary_best_model = sum(ancestral_root_original$best_overall_model %in% sensitivity_models),
   number_of_variables_where_reconstruction_differs_from_best_model = sum(
-    ancestral_root_original$best_overall_model != ancestral_root_original$reconstruction_model,
+    !mapply(
+      reconstruction_uses_winning_model,
+      ancestral_root_original$best_overall_model,
+      ancestral_root_original$reconstruction_model
+    ),
     na.rm = TRUE
   ),
   number_of_variables_where_root_outside_extant_range = sum(!ancestral_root_original$root_lies_within_extant_observed_range, na.rm = TRUE),
@@ -2284,7 +2425,11 @@ if (using_named_downstream_model_set) {
   write_csv(interpretability_metrics, model_set_file_path("ancestral_root_interpretability_metrics"))
 
   named_fallback_vars <- ancestral_root_original$variable[
-    ancestral_root_original$best_overall_model != ancestral_root_original$reconstruction_model
+    !mapply(
+      reconstruction_uses_winning_model,
+      ancestral_root_original$best_overall_model,
+      ancestral_root_original$reconstruction_model
+    )
   ]
   robust_root_vars <- ancestral_root_original$variable[ancestral_root_original$interpretability_flag == "none"]
   fragile_root_vars <- ancestral_root_original$variable[ancestral_root_original$interpretability_flag != "none"]
@@ -2309,6 +2454,16 @@ if (using_named_downstream_model_set) {
       "Core method statement:",
       "Ancestral climate was reconstructed in the original climate variables.",
       "PCA was used only to project the reconstructed root for visualization and diagnostics.",
+      paste0(
+        "All ",
+        nrow(ancestral_root_original),
+        " variables selected lambda within the five-model/no-OU universe."
+      ),
+      paste0(
+        "Downstream ancestral reconstruction used lambda_fastAnc for ",
+        sum(ancestral_root_original$reconstruction_model == "lambda_fastAnc", na.rm = TRUE),
+        " variable(s)."
+      ),
       "",
       paste0("Projected root status in displayed PCA space: ", projection$root_cloud_status),
       paste0("Projected root inside displayed extant convex hull: ", projection$root_inside_hull),
@@ -2358,6 +2513,7 @@ if (using_named_downstream_model_set) {
     "2. ancestral_root_projected_PCA_point_5models_no_OU.csv and ancestral_root_projected_PCA_ellipses_5models_no_OU.csv are visualization/diagnostic projections only.",
     "3. ancestral_climatic_core_plot_5models_no_OU.* is a figure derived from the projected root, not the inferential basis of reconstruction.",
     "4. biological_interpretation_summary_root_5models_no_OU.txt is the manuscript-facing summary for this five-model/no-OU Result Block 1 run.",
+    "5. In this completed five-model/no-OU run, all 12 variables selected lambda and downstream reconstruction used lambda_fastAnc.",
     "",
     "What should not be claimed:",
     "- Do not describe this as a six-model result.",

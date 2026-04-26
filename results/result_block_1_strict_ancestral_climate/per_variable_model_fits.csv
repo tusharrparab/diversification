@@ -1,13 +1,13 @@
 variable,best_overall_model,best_overall_AICc,primary_model,primary_AICc,primary_delta_from_best,caution_flag,contributes_to_main_root_estimate,contributes_to_uncertainty_ellipse
-annual_mean_temperature,lambda,103062.50982046372,lambda,103062.50982046372,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-annual_precipitation,lambda,154604.51549351556,lambda,154604.51549351556,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-maximum_temperature_warmest_month,lambda,97873.73466549734,lambda,97873.73466549734,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-mean_temperature_coldest_quarter,lambda,111003.13512859588,lambda,111003.13512859588,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-mean_temperature_driest_quarter,lambda,109498.0116501161,lambda,109498.0116501161,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-minimum_temperature_coldest_month,lambda,112260.89457268707,lambda,112260.89457268707,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-precipitation_in_coldest_quarter,lambda,135516.69840053283,lambda,135516.69840053283,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-precipitation_of_coldest_quarter,lambda,135516.69840046566,lambda,135516.69840046566,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-precipitation_of_wettest_quarter,lambda,136705.53718158937,lambda,136705.53718158937,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-precipitation_wettest_month,lambda,116564.56155126124,lambda,116564.56155126124,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-temperature_annual_range,lambda,110942.81219048033,lambda,110942.81219048033,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
-temperature_seasonality,lambda,176483.70772186446,lambda,176483.70772186446,0,primary_reconstruction_uncertain; root_outside_extant_range,FALSE,FALSE
+annual_mean_temperature,lambda,103062.50982046372,lambda,103062.50982046372,0,none,TRUE,TRUE
+annual_precipitation,lambda,154604.51549351556,lambda,154604.51549351556,0,none,TRUE,TRUE
+maximum_temperature_warmest_month,lambda,97873.73466549734,lambda,97873.73466549734,0,none,TRUE,TRUE
+mean_temperature_coldest_quarter,lambda,111003.13512859588,lambda,111003.13512859588,0,none,TRUE,TRUE
+mean_temperature_driest_quarter,lambda,109498.0116501161,lambda,109498.0116501161,0,none,TRUE,TRUE
+minimum_temperature_coldest_month,lambda,112260.89457268707,lambda,112260.89457268707,0,none,TRUE,TRUE
+precipitation_in_coldest_quarter,lambda,135516.69840053283,lambda,135516.69840053283,0,none,TRUE,TRUE
+precipitation_of_coldest_quarter,lambda,135516.69840046566,lambda,135516.69840046566,0,none,TRUE,TRUE
+precipitation_of_wettest_quarter,lambda,136705.53718158937,lambda,136705.53718158937,0,none,TRUE,TRUE
+precipitation_wettest_month,lambda,116564.56155126124,lambda,116564.56155126124,0,none,TRUE,TRUE
+temperature_annual_range,lambda,110942.81219048033,lambda,110942.81219048033,0,none,TRUE,TRUE
+temperature_seasonality,lambda,176483.70772186446,lambda,176483.70772186446,0,none,TRUE,TRUE
