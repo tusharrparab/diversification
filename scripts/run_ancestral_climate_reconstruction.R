@@ -1368,6 +1368,12 @@ cross_variable_coherence_diagnostics <- function(root_table) {
 # -----------------------------
 # Visualization-only PCA and projection
 # -----------------------------
+axis_sign_from_loadings <- function(loadings, vars, pc_idx) {
+  out <- sign(sum(loadings[loadings$variable %in% vars, paste0("PC", pc_idx)], na.rm = TRUE))
+  if (is.na(out) || out == 0) out <- 1
+  out
+}
+
 run_visualization_pca <- function(X, thermal_vars, precip_vars) {
   X_scaled <- scale(X)
   x_center <- attr(X_scaled, "scaled:center")
@@ -1406,10 +1412,12 @@ run_visualization_pca <- function(X, thermal_vars, precip_vars) {
   }
   pc2_idx <- remaining[which.max(precip_strength[match(remaining, candidate_pcs)])]
 
-  pc1_sign <- sign(sum(loadings[loadings$variable %in% thermal_vars, paste0("PC", pc1_idx)], na.rm = TRUE))
-  if (is.na(pc1_sign) || pc1_sign == 0) pc1_sign <- 1
-  pc2_sign <- sign(sum(loadings[loadings$variable %in% precip_vars, paste0("PC", pc2_idx)], na.rm = TRUE))
-  if (is.na(pc2_sign) || pc2_sign == 0) pc2_sign <- 1
+  pc1_sign <- axis_sign_from_loadings(loadings, thermal_vars, pc1_idx)
+  pc2_sign <- axis_sign_from_loadings(loadings, precip_vars, pc2_idx)
+  dominant_pc_x <- 1L
+  dominant_pc_y <- if (length(eigvals) >= 2) 2L else stop("PCA requires at least two components.")
+  dominant_sign_x <- axis_sign_from_loadings(loadings, thermal_vars, dominant_pc_x)
+  dominant_sign_y <- axis_sign_from_loadings(loadings, precip_vars, dominant_pc_y)
 
   scores$display_PCx_oriented <- scores[[paste0("PC", pc1_idx)]] * pc1_sign
   scores$display_PCy_oriented <- scores[[paste0("PC", pc2_idx)]] * pc2_sign
@@ -1423,10 +1431,47 @@ run_visualization_pca <- function(X, thermal_vars, precip_vars) {
     scores = scores,
     loadings = loadings,
     eigenvalues = eigenvalues,
+    dominant_pc_x = dominant_pc_x,
+    dominant_pc_y = dominant_pc_y,
+    dominant_sign_x = dominant_sign_x,
+    dominant_sign_y = dominant_sign_y,
+    biological_pc_x = pc1_idx,
+    biological_pc_y = pc2_idx,
+    biological_sign_x = pc1_sign,
+    biological_sign_y = pc2_sign,
     display_pc_x = pc1_idx,
     display_pc_y = pc2_idx,
     display_sign_x = pc1_sign,
     display_sign_y = pc2_sign
+  )
+}
+
+prepare_pca_axis_view <- function(pca_obj, clim_final, axis_x, axis_y, sign_x, sign_y, axis_mode) {
+  scores_out <- pca_obj$scores %>%
+    left_join(
+      clim_final %>% select(tree_label, species_original, species_clean),
+      by = "tree_label"
+    ) %>%
+    mutate(
+      display_PCx_oriented = .data[[paste0("PC", axis_x)]] * sign_x,
+      display_PCy_oriented = .data[[paste0("PC", axis_y)]] * sign_y
+    ) %>%
+    relocate(species_original, species_clean, tree_label, display_PCx_oriented, display_PCy_oriented)
+
+  loadings_out <- pca_obj$loadings %>%
+    mutate(
+      display_PCx_oriented = .data[[paste0("PC", axis_x)]] * sign_x,
+      display_PCy_oriented = .data[[paste0("PC", axis_y)]] * sign_y
+    )
+
+  list(
+    axis_mode = axis_mode,
+    axis_x = axis_x,
+    axis_y = axis_y,
+    sign_x = sign_x,
+    sign_y = sign_y,
+    scores_out = scores_out,
+    loadings_out = loadings_out
   )
 }
 
@@ -1463,7 +1508,15 @@ make_positive_definite <- function(cov_mat, label) {
   )
 }
 
-project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
+project_root_to_pca <- function(
+  root_projection_table,
+  pca_obj,
+  scores_out,
+  axis_x = pca_obj$display_pc_x,
+  axis_y = pca_obj$display_pc_y,
+  sign_x = pca_obj$display_sign_x,
+  sign_y = pca_obj$display_sign_y
+) {
   root_projection_vector <- root_projection_table$projection_value
   names(root_projection_vector) <- root_projection_table$variable
 
@@ -1471,8 +1524,8 @@ project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
   root_scores_all <- as.numeric(root_scaled %*% pca_obj$pca$rotation)
   names(root_scores_all) <- colnames(pca_obj$pca$x)
 
-  root_display_x <- unname(root_scores_all[paste0("PC", pca_obj$display_pc_x)]) * pca_obj$display_sign_x
-  root_display_y <- unname(root_scores_all[paste0("PC", pca_obj$display_pc_y)]) * pca_obj$display_sign_y
+  root_display_x <- unname(root_scores_all[paste0("PC", axis_x)]) * sign_x
+  root_display_y <- unname(root_scores_all[paste0("PC", axis_y)]) * sign_y
 
   hull_idx <- chull(scores_out$display_PCx_oriented, scores_out$display_PCy_oriented)
   hull_x <- scores_out$display_PCx_oriented[hull_idx]
@@ -1521,10 +1574,10 @@ project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
 
   root_point <- as_tibble(all_pc_cols) %>%
     mutate(
-      selected_display_PCx = paste0("PC", pca_obj$display_pc_x),
-      selected_display_PCy = paste0("PC", pca_obj$display_pc_y),
-      display_PCx_sign = pca_obj$display_sign_x,
-      display_PCy_sign = pca_obj$display_sign_y,
+      selected_display_PCx = paste0("PC", axis_x),
+      selected_display_PCy = paste0("PC", axis_y),
+      display_PCx_sign = sign_x,
+      display_PCy_sign = sign_y,
       display_PCx_oriented = root_display_x,
       display_PCy_oriented = root_display_y,
       root_inside_extant_convex_hull_displayed_2D = root_inside_hull,
@@ -1557,7 +1610,16 @@ project_root_to_pca <- function(root_projection_table, pca_obj, scores_out) {
 # This function intentionally uses a diagonal covariance matrix in the original
 # climate variables. That means the ellipse is an uncertainty projection of
 # per-variable ancestral estimates, not a full multivariate ancestral niche.
-project_root_uncertainty_to_pca <- function(root_projection_table, pca_obj, root_center, extant_hull_area) {
+project_root_uncertainty_to_pca <- function(
+  root_projection_table,
+  pca_obj,
+  root_center,
+  extant_hull_area,
+  axis_x = pca_obj$display_pc_x,
+  axis_y = pca_obj$display_pc_y,
+  sign_x = pca_obj$display_sign_x,
+  sign_y = pca_obj$display_sign_y
+) {
   root_var_vec <- root_projection_table$variance_used_for_uncertainty
   names(root_var_vec) <- root_projection_table$variable
 
@@ -1573,10 +1635,10 @@ project_root_uncertainty_to_pca <- function(root_projection_table, pca_obj, root
   Sigma_root_scaled <- S_inv %*% Sigma_root_original %*% S_inv
   Sigma_root_pca <- t(pca_obj$pca$rotation) %*% Sigma_root_scaled %*% pca_obj$pca$rotation
 
-  sign_mat <- diag(c(pca_obj$display_sign_x, pca_obj$display_sign_y))
+  sign_mat <- diag(c(sign_x, sign_y))
   Sigma2 <- Sigma_root_pca[
-    c(pca_obj$display_pc_x, pca_obj$display_pc_y),
-    c(pca_obj$display_pc_x, pca_obj$display_pc_y),
+    c(axis_x, axis_y),
+    c(axis_x, axis_y),
     drop = FALSE
   ]
   Sigma2 <- sign_mat %*% Sigma2 %*% sign_mat
@@ -1814,7 +1876,25 @@ write_interpretation_summary <- function(
   writeLines(lines, path)
 }
 
-make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_membership, eigenvalues, pca_obj, projection, density_surface) {
+make_pca_plot <- function(
+  scores_out,
+  root_point,
+  ellipse_df,
+  loadings,
+  core_membership,
+  eigenvalues,
+  axis_x,
+  axis_y,
+  projection,
+  density_surface,
+  xlab_txt,
+  ylab_txt,
+  title_txt,
+  subtitle_txt,
+  output_png,
+  output_pdf,
+  write_annotation_csv = FALSE
+) {
   arrow_mult <- 2.5
   thermal_arrows_df <- loadings %>%
     filter(variable %in% thermal_vars) %>%
@@ -1830,10 +1910,6 @@ make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_members
   ) %>%
     distinct(tree_label, .keep_all = TRUE)
 
-  var_pc1 <- percent(eigenvalues$variance_explained[pca_obj$display_pc_x], accuracy = 0.1)
-  var_pc2 <- percent(eigenvalues$variance_explained[pca_obj$display_pc_y], accuracy = 0.1)
-  xlab_txt <- paste0("Thermal climatic gradient (PC", pca_obj$display_pc_x, ", ", var_pc1, ")")
-  ylab_txt <- paste0("Precipitation climatic gradient (PC", pca_obj$display_pc_y, ", ", var_pc2, ")")
   centroid_df <- tibble(
     display_PCx_oriented = projection$centroid[[1]],
     display_PCy_oriented = projection$centroid[[2]]
@@ -1943,28 +2019,232 @@ make_plot <- function(scores_out, root_point, ellipse_df, loadings, core_members
     labs(
       x = xlab_txt,
       y = ylab_txt,
-      title = "Result Block 1: ancestral climatic origin of the crown radiation",
-      subtitle = "Root reconstructed in original climate variables; PCA, density, and hull used only for visualization"
+      title = title_txt,
+      subtitle = subtitle_txt
     ) +
     theme_classic(base_size = 12)
 
   ggsave(
-    filename = file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.png"),
+    filename = output_png,
     plot = p,
     width = 10,
     height = 8,
     dpi = 400
   )
   ggsave(
-    filename = file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.pdf"),
+    filename = output_pdf,
     plot = p,
     width = 10,
     height = 8
   )
 
-  write_csv(thermal_arrows_df, file.path(output_dir, "visualization_thermal_loading_arrows.csv"))
-  write_csv(precip_arrows_df, file.path(output_dir, "visualization_precipitation_loading_arrows.csv"))
-  write_csv(label_df, file.path(output_dir, "visualization_species_labels_used_in_plot.csv"))
+  if (isTRUE(write_annotation_csv)) {
+    write_csv(thermal_arrows_df, file.path(output_dir, "visualization_thermal_loading_arrows.csv"))
+    write_csv(precip_arrows_df, file.path(output_dir, "visualization_precipitation_loading_arrows.csv"))
+    write_csv(label_df, file.path(output_dir, "visualization_species_labels_used_in_plot.csv"))
+  }
+}
+
+make_original_variable_plot <- function(root_table, output_png, output_pdf) {
+  plot_df <- root_table %>%
+    transmute(
+      variable,
+      variable_group = if_else(.data$variable %in% thermal_vars, "thermal", "precipitation"),
+      root_estimate,
+      CI_low,
+      CI_high,
+      extant_mean,
+      extant_min,
+      extant_max,
+      root_position_relative_to_extant_distribution
+    ) %>%
+    mutate(
+      variable_label = str_replace_all(.data$variable, "_", " "),
+      variable_label = str_to_sentence(.data$variable_label),
+      classification = case_when(
+        str_detect(.data$root_position_relative_to_extant_distribution, "^central") ~ "central",
+        str_detect(.data$root_position_relative_to_extant_distribution, "^marginal") ~ "marginal",
+        str_detect(.data$root_position_relative_to_extant_distribution, "^extreme|^outside") ~ "extreme",
+        TRUE ~ "unknown"
+      )
+    )
+
+  p <- ggplot(plot_df, aes(y = 0)) +
+    geom_linerange(
+      aes(xmin = extant_min, xmax = extant_max, color = variable_group),
+      linewidth = 1.2,
+      alpha = 0.65
+    ) +
+    geom_point(
+      aes(x = extant_mean),
+      shape = 21,
+      size = 2.3,
+      fill = "white",
+      color = "black",
+      stroke = 0.4
+    ) +
+    geom_linerange(
+      aes(xmin = CI_low, xmax = CI_high),
+      linewidth = 2,
+      color = "firebrick"
+    ) +
+    geom_point(
+      aes(x = root_estimate, fill = classification),
+      shape = 21,
+      size = 2.9,
+      color = "black",
+      stroke = 0.4
+    ) +
+    facet_wrap(~variable_label, scales = "free_x", ncol = 2) +
+    scale_color_manual(values = c(thermal = "firebrick", precipitation = "steelblue4")) +
+    scale_fill_manual(values = c(central = "#1b9e77", marginal = "#d95f02", extreme = "#7570b3", unknown = "grey70")) +
+    labs(
+      x = "Original climate-variable value",
+      y = NULL,
+      title = "Result Block 1: ancestral climatic core in original variables",
+      subtitle = "Root estimate and CI shown against extant observed range; original-variable reconstruction is the inferential basis"
+    ) +
+    theme_classic(base_size = 12) +
+    theme(
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank(),
+      legend.position = "bottom"
+  )
+
+  ggsave(output_png, p, width = 11, height = 8.5, dpi = 400)
+  ggsave(output_pdf, p, width = 11, height = 8.5)
+}
+
+build_pca_reference_table <- function(pca_obj) {
+  vars <- names(pca_obj$x_center)
+  pcs <- pca_obj$eigenvalues$PC
+  ref_grid <- expand.grid(variable = vars, PC = pcs, stringsAsFactors = FALSE) %>%
+    as_tibble()
+
+  ref_grid %>%
+    mutate(
+      loading = mapply(function(v, pc) pca_obj$pca$rotation[v, pc], .data$variable, .data$PC),
+      pca_center = pca_obj$x_center[.data$variable],
+      pca_scale = pca_obj$x_scale[.data$variable],
+      variance_explained = pca_obj$eigenvalues$variance_explained[match(.data$PC, pca_obj$eigenvalues$PC)],
+      cumulative_variance = pca_obj$eigenvalues$cumulative_variance[match(.data$PC, pca_obj$eigenvalues$PC)],
+      dominant_axis_role = case_when(
+        .data$PC == paste0("PC", pca_obj$dominant_pc_x) ~ "x",
+        .data$PC == paste0("PC", pca_obj$dominant_pc_y) ~ "y",
+        TRUE ~ "none"
+      ),
+      biological_axis_role = case_when(
+        .data$PC == paste0("PC", pca_obj$biological_pc_x) ~ "x",
+        .data$PC == paste0("PC", pca_obj$biological_pc_y) ~ "y",
+        TRUE ~ "none"
+      )
+    )
+}
+
+write_block2_ready_files <- function(
+  ancestral_root_original,
+  named_root_output,
+  pca_obj,
+  projected_root_point_named,
+  pca_reference_path,
+  dominant_classification,
+  biological_classification
+) {
+  climate_set_label <- if (!is.null(climate_set_info$output_label) && nzchar(climate_set_info$output_label)) {
+    climate_set_info$output_label
+  } else {
+    climate_set
+  }
+
+  baseline_root <- ancestral_root_original %>%
+    transmute(
+      variable,
+      variable_type = if_else(.data$variable %in% thermal_vars, "thermal", "precipitation"),
+      root_estimate,
+      CI_low,
+      CI_high,
+      lambda_value_used = transform_parameter,
+      reconstruction_model_used = reconstruction_model,
+      best_model = best_overall_model,
+      model_universe = if_else(using_named_downstream_model_set, downstream_model_set, "standard_full_universe"),
+      OU_status = if_else(using_named_downstream_model_set, "excluded_deferred", "included_if_fit"),
+      climate_set = climate_set_label,
+      intended_time_bin_width_Myr = 5
+    )
+  write_csv(baseline_root, analysis_file_path("ancestral_core_baseline_for_5Myr_bins"))
+
+  pca_baseline <- projected_root_point_named %>%
+    mutate(
+      climate_set = climate_set_label,
+      model_universe = if_else(using_named_downstream_model_set, downstream_model_set, "standard_full_universe"),
+      OU_status = if_else(using_named_downstream_model_set, "excluded_deferred", "included_if_fit"),
+      dominant_axis_x_label = paste0("PC", pca_obj$dominant_pc_x),
+      dominant_axis_y_label = paste0("PC", pca_obj$dominant_pc_y),
+      biological_axis_x_label = paste0("PC", pca_obj$biological_pc_x),
+      biological_axis_y_label = paste0("PC", pca_obj$biological_pc_y),
+      dominant_axis_classification = dominant_classification,
+      biological_axis_classification = biological_classification,
+      pca_reference_file = basename(pca_reference_path),
+      pca_center_scale_reference_file = basename(pca_reference_path),
+      intended_time_bin_width_Myr = 5
+    )
+  write_csv(pca_baseline, analysis_file_path("ancestral_core_PCA_baseline_for_5Myr_bins"))
+
+  writeLines(
+    c(
+      paste0("analysis_output_label=", analysis_output_label),
+      paste0("climate_set=", climate_set_label),
+      "Block 2 will use 5-million-year bins.",
+      "Block 1 ancestral core is the fixed baseline for all later 5 Myr bin analyses.",
+      "Frontier displacement should be measured relative to this baseline.",
+      "Packing should be measured as lineage density per occupied climatic volume.",
+      "PCA transformations must reuse the same final6 PCA center, scale, and loadings recorded in the climate_PCA_reference file.",
+      "PCA remains a visualization/coordinate layer; original-variable ancestral reconstruction remains the inferential basis."
+    ),
+    analysis_file_path("block2_5Myr_timebin_config", ext = "txt")
+  )
+
+  paleoclimate_lines <- c(
+    paste0("Paleoclimate analog plan for ", analysis_output_label),
+    paste(rep("=", nchar(paste0("Paleoclimate analog plan for ", analysis_output_label))), collapse = ""),
+    "",
+    "Purpose:",
+    "Use paleoclimate analogs as a plausibility and climate-availability layer, not as the primary ancestral reconstruction method.",
+    "",
+    "Required variables:",
+    paste(paste0("- ", climate_vars), collapse = "\n"),
+    "",
+    "Root target values and CI windows:"
+  )
+
+  root_target_lines <- baseline_root %>%
+    transmute(line = paste0(
+      "- ", variable,
+      ": root=", signif(root_estimate, 5),
+      " [", signif(CI_low, 5), ", ", signif(CI_high, 5), "]"
+    )) %>%
+    pull(line)
+
+  paleoclimate_lines <- c(
+    paleoclimate_lines,
+    root_target_lines,
+    "",
+    "Suggested deep-time windows relevant to the avian radiation:",
+    "- Late Cretaceous to earliest Paleocene: broad plausibility framing only.",
+    "- Paleocene (66-56 Ma): early post-K-Pg climatic opportunity space.",
+    "- Eocene (56-33.9 Ma): warm greenhouse intervals and early crown diversification context.",
+    "- Oligocene to early Miocene (33.9-16 Ma): major cooling and restructuring context.",
+    "",
+    "Analog-cell identification strategy:",
+    "- Primary screen: root estimate plus CI windows in the six-variable climate vector.",
+    "- Complementary screen: standardized distance from the six-variable root vector using the same final6 scaling basis.",
+    "- Report both hard-window matches and ranked nearest analog cells.",
+    "",
+    "Use in later analyses:",
+    "- Paleoclimate analog maps should be used to assess whether the inferred ancestral core was climatically available in relevant deep-time windows.",
+    "- They should not replace the original-variable ancestral reconstruction."
+  )
+  writeLines(paleoclimate_lines, analysis_file_path("paleoclimate_analog_plan", ext = "txt"))
 }
 
 # -----------------------------
@@ -2594,14 +2874,36 @@ if (pipeline_stage == "root_reconstruction") {
 message("Running visualization-only PCA and projecting reconstructed root.")
 pca_obj <- run_visualization_pca(X, thermal_vars, precip_vars)
 
-scores_out <- pca_obj$scores %>%
-  left_join(
-    clim_final %>% select(tree_label, species_original, species_clean),
-    by = "tree_label"
-  ) %>%
-  relocate(species_original, species_clean, tree_label, display_PCx_oriented, display_PCy_oriented)
+biological_view <- prepare_pca_axis_view(
+  pca_obj,
+  clim_final,
+  axis_x = pca_obj$biological_pc_x,
+  axis_y = pca_obj$biological_pc_y,
+  sign_x = pca_obj$biological_sign_x,
+  sign_y = pca_obj$biological_sign_y,
+  axis_mode = "biological_axes"
+)
+dominant_view <- prepare_pca_axis_view(
+  pca_obj,
+  clim_final,
+  axis_x = pca_obj$dominant_pc_x,
+  axis_y = pca_obj$dominant_pc_y,
+  sign_x = pca_obj$dominant_sign_x,
+  sign_y = pca_obj$dominant_sign_y,
+  axis_mode = "PC1_PC2"
+)
 
-projection <- project_root_to_pca(root_projection_table, pca_obj, scores_out)
+scores_out <- biological_view$scores_out
+
+projection <- project_root_to_pca(
+  root_projection_table,
+  pca_obj,
+  biological_view$scores_out,
+  axis_x = biological_view$axis_x,
+  axis_y = biological_view$axis_y,
+  sign_x = biological_view$sign_x,
+  sign_y = biological_view$sign_y
+)
 projected_root_point <- projection$root_point %>%
   mutate(
     crown_node = crown_node,
@@ -2611,19 +2913,23 @@ projected_root_point <- projection$root_point %>%
     .before = 1
   )
 
-density_diagnostics <- compute_pca_density_diagnostics(scores_out, projected_root_point)
+biological_density_diagnostics <- compute_pca_density_diagnostics(biological_view$scores_out, projected_root_point)
 projected_root_point <- projected_root_point %>%
   mutate(
-    density_at_root_displayed_2D = density_diagnostics$root_density,
-    density_percentile_against_extant_distribution_displayed_2D = density_diagnostics$density_percentile,
-    density_classification_displayed_2D = density_diagnostics$density_classification
+    density_at_root_displayed_2D = biological_density_diagnostics$root_density,
+    density_percentile_against_extant_distribution_displayed_2D = biological_density_diagnostics$density_percentile,
+    density_classification_displayed_2D = biological_density_diagnostics$density_classification
   )
 
 uncertainty_projection <- project_root_uncertainty_to_pca(
   root_projection_table,
   pca_obj,
   root_center = projection$root_center,
-  extant_hull_area = projection$extant_hull_area
+  extant_hull_area = projection$extant_hull_area,
+  axis_x = biological_view$axis_x,
+  axis_y = biological_view$axis_y,
+  sign_x = biological_view$sign_x,
+  sign_y = biological_view$sign_y
 )
 ellipse_df <- uncertainty_projection$ellipse
 
@@ -2652,6 +2958,77 @@ core_membership <- scores_out %>%
     )
   ) %>%
   arrange(mahalanobis_d2_to_projected_root_uncertainty)
+
+dominant_projection <- project_root_to_pca(
+  root_projection_table,
+  pca_obj,
+  dominant_view$scores_out,
+  axis_x = dominant_view$axis_x,
+  axis_y = dominant_view$axis_y,
+  sign_x = dominant_view$sign_x,
+  sign_y = dominant_view$sign_y
+)
+dominant_root_point <- dominant_projection$root_point %>%
+  mutate(
+    crown_node = crown_node,
+    n_species_used = nrow(dominant_view$scores_out),
+    tree_is_rooted_after_pruning = is.rooted(tree_pruned),
+    projection_note = "root reconstructed in original variables; PCA used only for visualization",
+    .before = 1
+  )
+dominant_density_diagnostics <- compute_pca_density_diagnostics(dominant_view$scores_out, dominant_root_point)
+dominant_root_point <- dominant_root_point %>%
+  mutate(
+    density_at_root_displayed_2D = dominant_density_diagnostics$root_density,
+    density_percentile_against_extant_distribution_displayed_2D = dominant_density_diagnostics$density_percentile,
+    density_classification_displayed_2D = dominant_density_diagnostics$density_classification
+  )
+dominant_uncertainty_projection <- project_root_uncertainty_to_pca(
+  root_projection_table,
+  pca_obj,
+  root_center = dominant_projection$root_center,
+  extant_hull_area = dominant_projection$extant_hull_area,
+  axis_x = dominant_view$axis_x,
+  axis_y = dominant_view$axis_y,
+  sign_x = dominant_view$sign_x,
+  sign_y = dominant_view$sign_y
+)
+dominant_ellipse_df <- dominant_uncertainty_projection$ellipse %>%
+  mutate(
+    axis_mode = "PC1_PC2",
+    axis_x_label = paste0("PC", dominant_view$axis_x),
+    axis_y_label = paste0("PC", dominant_view$axis_y)
+  )
+dominant_core_md2 <- as.numeric(mahalanobis(
+  dominant_view$scores_out[, c("display_PCx_oriented", "display_PCy_oriented")],
+  center = dominant_projection$root_center,
+  cov = dominant_uncertainty_projection$cov
+))
+dominant_core_membership <- dominant_view$scores_out %>%
+  transmute(
+    species_original,
+    species_clean,
+    tree_label,
+    display_PCx_oriented,
+    display_PCy_oriented,
+    mahalanobis_d2_to_projected_root_uncertainty = dominant_core_md2,
+    inside_50_projected_root_ellipse = dominant_core_md2 <= qchisq(0.50, df = 2),
+    inside_80_projected_root_ellipse = dominant_core_md2 <= qchisq(0.80, df = 2),
+    inside_95_projected_root_ellipse = dominant_core_md2 <= qchisq(0.95, df = 2),
+    closest_projected_root_ellipse_level = case_when(
+      inside_50_projected_root_ellipse ~ "50%",
+      inside_80_projected_root_ellipse ~ "80%",
+      inside_95_projected_root_ellipse ~ "95%",
+      TRUE ~ "outside_95%"
+    )
+  ) %>%
+  arrange(mahalanobis_d2_to_projected_root_uncertainty)
+biological_ellipse_df_named <- ellipse_df %>%
+  mutate(
+    axis_mode = "biological_axes",
+    axis_x_label = paste0("PC", biological_view$axis_x),
+    axis_y_label = paste0("PC", biological_view$axis_y)
+  )
 
 ellipse_95_ratio <- ellipse_df$ellipse_area_to_extant_hull_area_ratio[ellipse_df$confidence_level == 0.95][1]
 
