@@ -84,6 +84,70 @@ get_cli_value <- function(args, key, default = NA_character_) {
 has_cli_flag <- function(args, key) {
   paste0("--", key) %in% args
 }
+detect_available_cores <- function() {
+  physical_cores <- suppressWarnings(parallel::detectCores(logical = FALSE))
+  logical_cores <- suppressWarnings(parallel::detectCores(logical = TRUE))
+  candidates <- c(physical_cores, logical_cores)
+  candidates <- candidates[is.finite(candidates) & candidates >= 1]
+  if (length(candidates) == 0) {
+    return(1L)
+  }
+  as.integer(max(candidates))
+}
+
+resolve_geiger_ncores <- function(args) {
+  cli_raw <- get_cli_value(args, "geiger-ncores", NA_character_)
+  env_raw <- Sys.getenv("GEIGER_NCORES", "")
+
+  requested_raw <- if (!is.na(cli_raw) && nzchar(str_trim(cli_raw))) {
+    str_trim(cli_raw)
+  } else if (nzchar(str_trim(env_raw))) {
+    str_trim(env_raw)
+  } else {
+    "auto"
+  }
+
+  available_cores <- detect_available_cores()
+  auto_cores <- max(1L, as.integer(available_cores) - 1L)
+
+  if (tolower(requested_raw) %in% c("auto", "default", "max")) {
+    return(auto_cores)
+  }
+
+  requested_cores <- suppressWarnings(as.integer(requested_raw))
+  if (is.na(requested_cores) || requested_cores < 1L) {
+    warning(
+      paste0(
+        "Invalid GEIGER_NCORES/geiger-ncores value '",
+        requested_raw,
+        "'; using auto core selection (",
+        auto_cores,
+        ")."
+      ),
+      immediate. = TRUE,
+      call. = FALSE
+    )
+    return(auto_cores)
+  }
+
+  if (requested_cores > available_cores) {
+    warning(
+      paste0(
+        "Requested GEIGER_NCORES/geiger-ncores=",
+        requested_cores,
+        " exceeds detected cores (",
+        available_cores,
+        "); capping to ",
+        available_cores,
+        "."
+      ),
+      immediate. = TRUE,
+      call. = FALSE
+    )
+  }
+
+  as.integer(min(requested_cores, available_cores))
+}
 
 args <- commandArgs(trailingOnly = TRUE)
 
@@ -96,8 +160,49 @@ pipeline_stage <- match.arg(
   choices = c("all", "model_fit", "root_reconstruction", "pca_projection", "plot")
 )
 
-geiger_ncores <- suppressWarnings(as.integer(Sys.getenv("GEIGER_NCORES", "1")))
-if (is.na(geiger_ncores) || geiger_ncores < 1) geiger_ncores <- 1
+geiger_ncores <- resolve_geiger_ncores(args)
+message(
+  "Model fitting parallelism (geiger ncores): ",
+  geiger_ncores,
+  " (override with GEIGER_NCORES or --geiger-ncores)"
+)
+resolve_model_ncores <- function(model_name, requested_ncores) {
+  model_ncores <- as.integer(requested_ncores)
+  if (is.na(model_ncores) || model_ncores < 1L) model_ncores <- 1L
+
+  if (.Platform$OS.type == "windows" && identical(model_name, "OU") && model_ncores > 1L) {
+    message(
+      "Using ncores=1 for OU model fitting on Windows to avoid geiger::fitContinuous parallel crash; ",
+      "multi-core remains enabled for other models."
+    )
+    model_ncores <- 1L
+  }
+
+  model_ncores
+}
+model_fit_niter <- suppressWarnings(as.integer(Sys.getenv("MODEL_FIT_NITER", "100")))
+if (is.na(model_fit_niter) || model_fit_niter < 1) model_fit_niter <- 100
+model_fit_progress_chunks <- suppressWarnings(as.integer(Sys.getenv("MODEL_FIT_PROGRESS_CHUNKS", "10")))
+if (is.na(model_fit_progress_chunks) || model_fit_progress_chunks < 1) model_fit_progress_chunks <- 10
+model_fit_progress_chunks <- min(model_fit_progress_chunks, model_fit_niter)
+use_gpu_acceleration <- truthy(Sys.getenv("USE_GPU_ACCELERATION", "false")) ||
+  has_cli_flag(args, "use-gpu-acceleration")
+gpu_backend <- str_trim(get_cli_value(args, "gpu-backend", Sys.getenv("GPU_BACKEND", "gpuR")))
+gpu_backend <- match.arg(gpu_backend, choices = c("gpuR", "none"))
+force_unstable_ou <- truthy(Sys.getenv("FORCE_UNSTABLE_OU", "false")) ||
+  has_cli_flag(args, "force-unstable-ou")
+if (isTRUE(use_gpu_acceleration)) {
+  message(
+    "GPU acceleration requested. geiger::fitContinuous remains CPU-bound; ",
+    "GPU is applied to eligible matrix multiplications when backend support is available."
+  )
+}
+if (.Platform$OS.type == "windows" && !isTRUE(force_unstable_ou)) {
+  message(
+    "Windows OU stability guard active: OU model fits are skipped by default. ",
+    "Set FORCE_UNSTABLE_OU=true or --force-unstable-ou to force OU fitting attempts."
+  )
+}
 
 skip_plots <- truthy(Sys.getenv("SKIP_PLOTS", "false")) || has_cli_flag(args, "skip-plots")
 force_refit_models <- truthy(Sys.getenv("FORCE_REFIT_MODELS", "false")) ||
@@ -139,6 +244,136 @@ pipeline_warnings <- character()
 add_pipeline_warning <- function(message_text) {
   pipeline_warnings <<- c(pipeline_warnings, message_text)
   warning(message_text, immediate. = TRUE, call. = FALSE)
+}
+
+progress_bar <- function(current, total, width = 28) {
+  if (!is.finite(total) || total <= 0) {
+    return("[----------------------------] 0/0 (0.0%)")
+  }
+  current <- max(0, min(current, total))
+  frac <- current / total
+  filled <- as.integer(round(width * frac))
+  paste0(
+    "[",
+    strrep("=", filled),
+    strrep("-", width - filled),
+    "] ",
+    current,
+    "/",
+    total,
+    " (",
+    sprintf("%.1f", frac * 100),
+    "%)"
+  )
+}
+
+progress_step <- function(stage, current, total, detail, indent = "") {
+  message(indent, "[", stage, "] ", progress_bar(current, total), " ", detail)
+}
+split_niter_chunks <- function(total_niter, n_chunks) {
+  n_chunks <- max(1L, min(as.integer(n_chunks), as.integer(total_niter)))
+  chunk_sizes <- rep(total_niter %/% n_chunks, n_chunks)
+  remainder <- total_niter %% n_chunks
+  if (remainder > 0) {
+    chunk_sizes[seq_len(remainder)] <- chunk_sizes[seq_len(remainder)] + 1L
+  }
+  chunk_sizes[chunk_sizes > 0]
+}
+
+gpu_runtime <- new.env(parent = emptyenv())
+gpu_runtime$initialized <- FALSE
+gpu_runtime$enabled <- FALSE
+gpu_runtime$backend <- "none"
+
+initialize_gpu_runtime <- function() {
+  if (gpu_runtime$initialized) return(invisible(gpu_runtime$enabled))
+  gpu_runtime$initialized <- TRUE
+
+  if (!isTRUE(use_gpu_acceleration) || identical(gpu_backend, "none")) {
+    gpu_runtime$enabled <- FALSE
+    gpu_runtime$backend <- "none"
+    return(invisible(FALSE))
+  }
+
+  if (!requireNamespace("gpuR", quietly = TRUE)) {
+    add_pipeline_warning(
+      "GPU acceleration requested but optional package 'gpuR' is not installed; continuing on CPU."
+    )
+    gpu_runtime$enabled <- FALSE
+    gpu_runtime$backend <- "none"
+    return(invisible(FALSE))
+  }
+
+  gpu_ok <- tryCatch(
+    {
+      test_mat <- matrix(c(1, 2, 3, 4), nrow = 2, byrow = TRUE)
+      gpu_a <- gpuR::gpuMatrix(test_mat, nrow = 2, ncol = 2, type = "float")
+      gpu_b <- gpuR::gpuMatrix(test_mat, nrow = 2, ncol = 2, type = "float")
+      gpu_out <- gpu_a %*% gpu_b
+      out <- as.matrix(gpu_out[])
+      is.matrix(out) && nrow(out) == 2 && ncol(out) == 2
+    },
+    error = function(e) {
+      add_pipeline_warning(
+        paste0(
+          "GPU acceleration requested, but gpuR backend initialization failed; using CPU. Error: ",
+          conditionMessage(e)
+        )
+      )
+      FALSE
+    }
+  )
+
+  if (isTRUE(gpu_ok)) {
+    gpu_runtime$enabled <- TRUE
+    gpu_runtime$backend <- "gpuR"
+    message("GPU acceleration enabled for matrix multiplications via gpuR.")
+  } else {
+    gpu_runtime$enabled <- FALSE
+    gpu_runtime$backend <- "none"
+  }
+
+  invisible(gpu_runtime$enabled)
+}
+
+as_numeric_matrix <- function(x) {
+  if (is.null(dim(x))) {
+    matrix(as.numeric(x), nrow = 1)
+  } else {
+    matrix(as.numeric(x), nrow = nrow(x), ncol = ncol(x), dimnames = dimnames(x))
+  }
+}
+
+matmul_with_optional_gpu <- function(A, B, operation_label = "matrix_multiply") {
+  A_mat <- as_numeric_matrix(A)
+  B_mat <- as_numeric_matrix(B)
+  initialize_gpu_runtime()
+
+  if (!isTRUE(gpu_runtime$enabled)) {
+    return(A_mat %*% B_mat)
+  }
+
+  tryCatch(
+    {
+      A_gpu <- gpuR::gpuMatrix(A_mat, nrow = nrow(A_mat), ncol = ncol(A_mat), type = "float")
+      B_gpu <- gpuR::gpuMatrix(B_mat, nrow = nrow(B_mat), ncol = ncol(B_mat), type = "float")
+      out_gpu <- A_gpu %*% B_gpu
+      as.matrix(out_gpu[])
+    },
+    error = function(e) {
+      add_pipeline_warning(
+        paste0(
+          "GPU matmul failed for ",
+          operation_label,
+          "; falling back to CPU. Error: ",
+          conditionMessage(e)
+        )
+      )
+      gpu_runtime$enabled <- FALSE
+      gpu_runtime$backend <- "none"
+      A_mat %*% B_mat
+    }
+  )
 }
 
 # -----------------------------
@@ -344,35 +579,23 @@ classify_ratio_size <- function(ratio) {
 # -----------------------------
 all_climate_vars <- c(
   "annual_mean_temperature",
-  "annual_precipitation",
-  "maximum_temperature_warmest_month",
-  "mean_temperature_coldest_quarter",
-  "mean_temperature_driest_quarter",
   "minimum_temperature_coldest_month",
-  "precipitation_in_coldest_quarter",
-  "precipitation_of_coldest_quarter",
+  "temperature_seasonality",
+  "annual_precipitation",
   "precipitation_of_wettest_quarter",
-  "precipitation_wettest_month",
-  "temperature_annual_range",
-  "temperature_seasonality"
+  "precipitation_of_coldest_quarter"
 )
 
 all_thermal_vars <- c(
   "annual_mean_temperature",
-  "mean_temperature_coldest_quarter",
-  "mean_temperature_driest_quarter",
-  "maximum_temperature_warmest_month",
   "minimum_temperature_coldest_month",
-  "temperature_annual_range",
   "temperature_seasonality"
 )
 
 all_precip_vars <- c(
   "annual_precipitation",
-  "precipitation_in_coldest_quarter",
-  "precipitation_of_coldest_quarter",
   "precipitation_of_wettest_quarter",
-  "precipitation_wettest_month"
+  "precipitation_of_coldest_quarter"
 )
 
 climate_set_definitions <- list(
@@ -571,36 +794,129 @@ summarize_fit_parameters <- function(fit_obj) {
   )
 }
 
+fit_rank_score <- function(fit_obj) {
+  aicc <- extract_fit_stat(fit_obj, c("aicc", "AICc"))
+  if (is.finite(aicc)) return(-aicc)
+  loglik <- extract_fit_stat(fit_obj, c("lnL", "logLik", "loglik"))
+  if (is.finite(loglik)) return(loglik)
+  -Inf
+}
+
 fit_one_model <- function(tree, trait, variable, model) {
   warnings_seen <- character()
+  chunk_errors <- character()
+  model_ncores <- resolve_model_ncores(model, geiger_ncores)
+
+  if (.Platform$OS.type == "windows" && identical(model, "OU") && !isTRUE(force_unstable_ou)) {
+    skip_msg <- paste0(
+      "OU fit skipped for ",
+      variable,
+      " on Windows due unstable geiger::fitContinuous process termination on this dataset. ",
+      "Set FORCE_UNSTABLE_OU=true or --force-unstable-ou to force attempts."
+    )
+    add_pipeline_warning(skip_msg)
+    return(list(
+      row = tibble(
+        variable = variable,
+        model = model,
+        model_role = if_else(model %in% primary_models, "primary", "sensitivity_only"),
+        fit_status = "skipped_windows_stability_guard",
+        logLik = NA_real_,
+        AIC = NA_real_,
+        AICc = NA_real_,
+        parameter_summary = NA_character_,
+        fit_warning = skip_msg,
+        fit_error = NA_character_
+      ),
+      fit = NULL
+    ))
+  }
 
   tryCatch(
     {
-      fit <- withCallingHandlers(
-        geiger::fitContinuous(
-          phy = tree,
-          dat = trait,
-          model = model,
-          control = list(
-            method = c("subplex", "L-BFGS-B"),
-            niter = 100,
-            hessian = FALSE,
-            CI = 0.95
+      niter_chunks <- split_niter_chunks(model_fit_niter, model_fit_progress_chunks)
+      total_chunks <- length(niter_chunks)
+      niter_done <- 0L
+      best_fit <- NULL
+      best_score <- -Inf
+
+      for (chunk_idx in seq_along(niter_chunks)) {
+        chunk_niter <- niter_chunks[[chunk_idx]]
+        progress_step(
+          stage = "model_fit:optimizer_chunks",
+          current = chunk_idx,
+          total = total_chunks,
+          detail = paste0(
+            variable,
+            " :: ",
+            model,
+            " (niter ",
+            niter_done + 1L,
+            "-",
+            niter_done + chunk_niter,
+            ")"
           ),
-          ncores = geiger_ncores
-        ),
-        warning = function(w) {
-          warnings_seen <<- c(warnings_seen, conditionMessage(w))
-          invokeRestart("muffleWarning")
+          indent = "        "
+        )
+
+        chunk_fit <- tryCatch(
+          withCallingHandlers(
+            geiger::fitContinuous(
+              phy = tree,
+              dat = trait,
+              model = model,
+              control = list(
+                method = c("subplex", "L-BFGS-B"),
+                niter = chunk_niter,
+                hessian = FALSE,
+                CI = 0.95
+              ),
+              ncores = model_ncores
+            ),
+            warning = function(w) {
+              warnings_seen <<- c(warnings_seen, conditionMessage(w))
+              invokeRestart("muffleWarning")
+            }
+          ),
+          error = function(e) {
+            chunk_errors <<- c(chunk_errors, conditionMessage(e))
+            NULL
+          }
+        )
+
+        if (!is.null(chunk_fit) && is.list(chunk_fit$opt)) {
+          chunk_score <- fit_rank_score(chunk_fit)
+          if (is.null(best_fit) || chunk_score > best_score) {
+            best_fit <- chunk_fit
+            best_score <- chunk_score
+          }
+        } else if (!is.null(chunk_fit)) {
+          chunk_errors <- c(chunk_errors, "fitContinuous returned malformed opt in one optimizer chunk")
         }
-      )
+
+        niter_done <- niter_done + chunk_niter
+        progress_step(
+          stage = "model_fit:optimizer_niter",
+          current = niter_done,
+          total = model_fit_niter,
+          detail = paste0(variable, " :: ", model),
+          indent = "        "
+        )
+      }
+
+      fit <- best_fit
 
       if (is.null(fit$opt) || !is.list(fit$opt)) {
-        stop("geiger::fitContinuous returned a malformed fit object without a list-valued opt slot")
+        stop(
+          "geiger::fitContinuous did not produce a valid fit object across optimizer chunks. ",
+          "Chunk errors: ",
+          collapse_flags(chunk_errors)
+        )
       }
 
       aicc <- extract_fit_stat(fit, c("aicc", "AICc"))
       fit_status <- if (is.finite(aicc)) "ok" else "fit_returned_no_finite_AICc"
+      chunk_error_summary <- if (length(chunk_errors) == 0) NA_character_ else paste0("chunk_errors=", collapse_flags(chunk_errors))
 
       list(
         row = tibble(
@@ -612,13 +928,14 @@ fit_one_model <- function(tree, trait, variable, model) {
           AIC = extract_fit_stat(fit, c("aic", "AIC")),
           AICc = aicc,
           parameter_summary = summarize_fit_parameters(fit),
-          fit_warning = collapse_flags(warnings_seen),
+          fit_warning = collapse_flags(c(warnings_seen, chunk_error_summary)),
           fit_error = NA_character_
         ),
         fit = fit
       )
     },
     error = function(e) {
+      chunk_error_summary <- if (length(chunk_errors) == 0) NA_character_ else paste0("chunk_errors=", collapse_flags(chunk_errors))
       list(
         row = tibble(
           variable = variable,
@@ -629,8 +946,8 @@ fit_one_model <- function(tree, trait, variable, model) {
           AIC = NA_real_,
           AICc = NA_real_,
           parameter_summary = NA_character_,
-          fit_warning = collapse_flags(warnings_seen),
-          fit_error = conditionMessage(e)
+          fit_warning = collapse_flags(c(warnings_seen, chunk_error_summary)),
+          fit_error = collapse_flags(c(conditionMessage(e), chunk_error_summary))
         ),
         fit = NULL
       )
@@ -677,13 +994,22 @@ fit_models_for_variable <- function(tree, trait, variable, models_to_fit = candi
     message("  fitting or loading selected candidate models for ", variable, ": ", paste(models_to_fit, collapse = ", "))
   }
 
-  for (m in models_to_fit) {
+  total_models <- length(models_to_fit)
+  for (model_idx in seq_along(models_to_fit)) {
+    m <- models_to_fit[[model_idx]]
+    progress_step(
+      stage = "model_fit:models",
+      current = model_idx,
+      total = total_models,
+      detail = paste0(variable, " :: ", m),
+      indent = "    "
+    )
     if (cache_valid && !force_refit_models && m %in% existing_models) {
-      message("    using cached fitContinuous fit for ", variable, " under ", m)
+      message("      using cached fitContinuous fit for ", variable, " under ", m)
       next
     }
 
-    message("    ", variable, " under ", m)
+    message("      fitting ", variable, " under ", m)
     fit_result <- fit_one_model(tree, trait, variable = variable, model = m)
     fit_objects[[m]] <- fit_result$fit
     if ("model" %in% names(fit_rows)) {
@@ -703,7 +1029,7 @@ fit_models_for_variable <- function(tree, trait, variable, models_to_fit = candi
     )
     saveRDS(out, cache_path)
     existing_models <- unique(as.character(fit_rows$model))
-    message("    saved fitContinuous cache for ", variable, " after ", m)
+    message("      saved fitContinuous cache for ", variable, " after ", m)
   }
 
   list(
@@ -944,29 +1270,32 @@ reconstruct_primary_root <- function(tree, trait, variable, primary_model, fit_o
         stop("Trait vector contains non-finite values after tree reordering")
       }
 
-      ace_fit <- ape::ace(
+      fast_fit <- phytools::fastAnc(
+        tree = recon_tree,
         x = trait_reordered,
-        phy = recon_tree,
-        type = "continuous",
-        method = "ML",
-        model = "BM",
+        vars = TRUE,
         CI = TRUE
       )
 
-      ci <- extract_root_ci(ace_fit, recon_tree)
-      root_variance <- variance_from_ci(ci[1], ci[2])
+      ci <- extract_root_ci(fast_fit, recon_tree)
+      root_variance_direct <- extract_root_variance(fast_fit, recon_tree)
+      root_variance <- if (is.finite(root_variance_direct)) {
+        root_variance_direct
+      } else {
+        variance_from_ci(ci[1], ci[2])
+      }
 
       tibble(
         variable = variable,
-        reconstruction_model = if_else(primary_model == "lambda", "lambda_ace_fallback", primary_model),
+        reconstruction_model = if_else(primary_model == "lambda", "lambda_fastAnc_fallback", primary_model),
         transform_parameter = tree_info$transform_parameter,
         transform_status = tree_info$transform_status,
-        root_estimate = extract_root_value(ace_fit, recon_tree),
+        root_estimate = extract_root_value(fast_fit, recon_tree),
         root_variance = root_variance,
-        root_variance_source = if_else(
-          is.finite(root_variance),
-          "CI95_width_assuming_normality",
-          "unavailable"
+        root_variance_source = case_when(
+          is.finite(root_variance_direct) ~ "fastAnc_root_variance",
+          is.finite(root_variance) ~ "CI95_width_assuming_normality",
+          TRUE ~ "unavailable"
         ),
         CI_low = ci[1],
         CI_high = ci[2],
@@ -1287,78 +1616,35 @@ cross_variable_coherence_diagnostics <- function(root_table) {
 
   rows <- list(
     tibble(
-      rule_id = "thermal_mean_vs_cold_quarter",
-      variables_involved = "annual_mean_temperature; mean_temperature_coldest_quarter; temperature_annual_range",
-      screen_result = if (
-        level("annual_mean_temperature") == "high" &&
-          level("mean_temperature_coldest_quarter") == "low" &&
-          level("temperature_annual_range") != "high"
-      ) {
-        "potentially_contradictory"
-      } else {
-        "no_strong_contradiction_detected"
-      },
-      explanation = "Warm annual mean but cold quarter without high annual range is biologically difficult to interpret."
-    ),
-    tibble(
-      rule_id = "thermal_max_vs_min",
-      variables_involved = "maximum_temperature_warmest_month; minimum_temperature_coldest_month; temperature_annual_range",
-      screen_result = if (
-        level("maximum_temperature_warmest_month") == "high" &&
-          level("minimum_temperature_coldest_month") == "low" &&
-          level("temperature_annual_range") != "high"
-      ) {
-        "potentially_contradictory"
-      } else {
-        "no_strong_contradiction_detected"
-      },
-      explanation = "Hot warmest month and cold coldest month should usually coincide with high annual range."
-    ),
-    tibble(
-      rule_id = "temperature_seasonality_vs_range",
-      variables_involved = "temperature_seasonality; temperature_annual_range",
-      screen_result = if (
-        (level("temperature_seasonality") == "high" && level("temperature_annual_range") == "low") ||
-          (level("temperature_seasonality") == "low" && level("temperature_annual_range") == "high")
-      ) {
-        "potentially_contradictory"
-      } else {
-        "no_strong_contradiction_detected"
-      },
-      explanation = "Temperature seasonality and annual range are expected to broadly agree."
-    ),
-    tibble(
       rule_id = "annual_precip_vs_wettest_quarter",
-      variables_involved = "annual_precipitation; precipitation_of_wettest_quarter; precipitation_wettest_month",
+      variables_involved = "annual_precipitation; precipitation_of_wettest_quarter",
       screen_result = if (
         level("annual_precipitation") == "high" &&
-          level("precipitation_of_wettest_quarter") == "low" &&
-          level("precipitation_wettest_month") == "low"
+          level("precipitation_of_wettest_quarter") == "low"
       ) {
         "potentially_contradictory"
       } else if (
         level("annual_precipitation") == "low" &&
-          (level("precipitation_of_wettest_quarter") == "high" || level("precipitation_wettest_month") == "high")
+          level("precipitation_of_wettest_quarter") == "high"
       ) {
         "seasonal_precipitation_caution"
       } else {
         "no_strong_contradiction_detected"
       },
-      explanation = "Annual precipitation should broadly agree with wettest-period precipitation unless precipitation is highly seasonal."
+      explanation = "Annual precipitation should broadly agree with wettest-quarter precipitation unless precipitation is highly seasonal."
     ),
     tibble(
-      rule_id = "cold_quarter_precip_duplicate_check",
-      variables_involved = "precipitation_in_coldest_quarter; precipitation_of_coldest_quarter",
+      rule_id = "thermal_mean_vs_min_temp",
+      variables_involved = "annual_mean_temperature; minimum_temperature_coldest_month",
       screen_result = if (
-        level("precipitation_in_coldest_quarter") != "unknown" &&
-          level("precipitation_of_coldest_quarter") != "unknown" &&
-          level("precipitation_in_coldest_quarter") != level("precipitation_of_coldest_quarter")
+        level("annual_mean_temperature") == "high" &&
+          level("minimum_temperature_coldest_month") == "low"
       ) {
         "potentially_contradictory"
       } else {
         "no_strong_contradiction_detected"
       },
-      explanation = "These two cold-quarter precipitation variables should not strongly disagree if they represent the same biology."
+      explanation = "A warm annual mean combined with a very cold minimum temperature month may indicate high seasonality."
     )
   )
 
@@ -1521,7 +1807,13 @@ project_root_to_pca <- function(
   names(root_projection_vector) <- root_projection_table$variable
 
   root_scaled <- (root_projection_vector[names(pca_obj$x_center)] - pca_obj$x_center) / pca_obj$x_scale
-  root_scores_all <- as.numeric(root_scaled %*% pca_obj$pca$rotation)
+  root_scores_all <- as.numeric(
+    matmul_with_optional_gpu(
+      matrix(root_scaled, nrow = 1),
+      pca_obj$pca$rotation,
+      operation_label = "root_projection_to_pca_scores"
+    )
+  )
   names(root_scores_all) <- colnames(pca_obj$pca$x)
 
   root_display_x <- unname(root_scores_all[paste0("PC", axis_x)]) * sign_x
@@ -1632,8 +1924,24 @@ project_root_uncertainty_to_pca <- function(
   colnames(Sigma_root_original) <- names(pca_obj$x_center)
 
   S_inv <- diag(1 / pca_obj$x_scale)
-  Sigma_root_scaled <- S_inv %*% Sigma_root_original %*% S_inv
-  Sigma_root_pca <- t(pca_obj$pca$rotation) %*% Sigma_root_scaled %*% pca_obj$pca$rotation
+  Sigma_root_scaled <- matmul_with_optional_gpu(
+    matmul_with_optional_gpu(
+      S_inv,
+      Sigma_root_original,
+      operation_label = "sigma_root_scaled_left"
+    ),
+    S_inv,
+    operation_label = "sigma_root_scaled_right"
+  )
+  Sigma_root_pca <- matmul_with_optional_gpu(
+    matmul_with_optional_gpu(
+      t(pca_obj$pca$rotation),
+      Sigma_root_scaled,
+      operation_label = "sigma_root_pca_left"
+    ),
+    pca_obj$pca$rotation,
+    operation_label = "sigma_root_pca_right"
+  )
 
   sign_mat <- diag(c(sign_x, sign_y))
   Sigma2 <- Sigma_root_pca[
@@ -1641,7 +1949,15 @@ project_root_uncertainty_to_pca <- function(
     c(axis_x, axis_y),
     drop = FALSE
   ]
-  Sigma2 <- sign_mat %*% Sigma2 %*% sign_mat
+  Sigma2 <- matmul_with_optional_gpu(
+    matmul_with_optional_gpu(
+      sign_mat,
+      Sigma2,
+      operation_label = "sigma2_sign_orient_left"
+    ),
+    sign_mat,
+    operation_label = "sigma2_sign_orient_right"
+  )
   cov_info <- make_positive_definite(Sigma2, "Projected root uncertainty")
   Sigma2 <- cov_info$cov
 
@@ -2265,45 +2581,22 @@ clim <- read_csv(climate_file, show_col_types = FALSE)
 species_col <- pick_existing_column(clim, c("species"))
 col_map <- list(
   annual_mean_temperature = c("annual_mean_temperature", "Annual mean temperature_mean"),
-  annual_precipitation = c("annual_precipitation", "Annual precipitation_mean"),
-  maximum_temperature_warmest_month = c(
-    "maximum_temperature_warmest_month",
-    "Max Temperature_warmest month_mean"
-  ),
-  mean_temperature_coldest_quarter = c(
-    "mean_temperature_coldest_quarter",
-    "Mean Temp coldest Quarter_mean"
-  ),
-  mean_temperature_driest_quarter = c(
-    "mean_temperature_driest_quarter",
-    "Mean Temp Driest Quarter_mean"
-  ),
   minimum_temperature_coldest_month = c(
     "minimum_temperature_coldest_month",
     "Min Temp_Coldest Month_mean"
   ),
-  precipitation_in_coldest_quarter = c(
-    "precipitation_in_coldest_quarter",
-    "Precipitation in Coldest Quarter_mean"
+  temperature_seasonality = c(
+    "temperature_seasonality",
+    "Temp Seasonality (Standard Deviation)_mean"
   ),
-  precipitation_of_coldest_quarter = c(
-    "precipitation_of_coldest_quarter",
-    "Precipitation of coldest Quarter_mean"
-  ),
+  annual_precipitation = c("annual_precipitation", "Annual precipitation_mean"),
   precipitation_of_wettest_quarter = c(
     "precipitation_of_wettest_quarter",
     "Precipitation of Wettest Quarter_mean"
   ),
-  precipitation_wettest_month = c(
-    "precipitation_wetest_month",
-    "precipitation_wettest_month",
-    "Precipitation Wetest Month_mean",
-    "Precipitation Wettest Month_mean"
-  ),
-  temperature_annual_range = c("temperature_annual_range", "Temp Annual Range_mean"),
-  temperature_seasonality = c(
-    "temperature_seasonality",
-    "Temp Seasonality (Standard Deviation)_mean"
+  precipitation_of_coldest_quarter = c(
+    "precipitation_of_coldest_quarter",
+    "Precipitation of coldest Quarter_mean"
   )
 )
 
@@ -2319,18 +2612,12 @@ clim2 <- clim %>%
     species_original = .data[[species_col]],
     species_clean = clean_text(.data[[species_col]]),
     tree_label = normalize_species(.data[[species_col]]),
-    annual_mean_temperature = as.numeric(.data[[selected_cols$annual_mean_temperature]]),
-    annual_precipitation = as.numeric(.data[[selected_cols$annual_precipitation]]),
-    maximum_temperature_warmest_month = as.numeric(.data[[selected_cols$maximum_temperature_warmest_month]]),
-    mean_temperature_coldest_quarter = as.numeric(.data[[selected_cols$mean_temperature_coldest_quarter]]),
-    mean_temperature_driest_quarter = as.numeric(.data[[selected_cols$mean_temperature_driest_quarter]]),
+    annual_mean_temperature           = as.numeric(.data[[selected_cols$annual_mean_temperature]]),
     minimum_temperature_coldest_month = as.numeric(.data[[selected_cols$minimum_temperature_coldest_month]]),
-    precipitation_in_coldest_quarter = as.numeric(.data[[selected_cols$precipitation_in_coldest_quarter]]),
-    precipitation_of_coldest_quarter = as.numeric(.data[[selected_cols$precipitation_of_coldest_quarter]]),
-    precipitation_of_wettest_quarter = as.numeric(.data[[selected_cols$precipitation_of_wettest_quarter]]),
-    precipitation_wettest_month = as.numeric(.data[[selected_cols$precipitation_wettest_month]]),
-    temperature_annual_range = as.numeric(.data[[selected_cols$temperature_annual_range]]),
-    temperature_seasonality = as.numeric(.data[[selected_cols$temperature_seasonality]])
+    temperature_seasonality           = as.numeric(.data[[selected_cols$temperature_seasonality]]),
+    annual_precipitation              = as.numeric(.data[[selected_cols$annual_precipitation]]),
+    precipitation_of_wettest_quarter  = as.numeric(.data[[selected_cols$precipitation_of_wettest_quarter]]),
+    precipitation_of_coldest_quarter  = as.numeric(.data[[selected_cols$precipitation_of_coldest_quarter]])
   )
 
 duplicate_species <- clim2 %>%
@@ -2498,7 +2785,15 @@ if (using_named_downstream_model_set && !identical(pipeline_stage, "model_fit"))
   message("Model-fit variable scope: ", paste(model_fit_variables, collapse = ", "))
   message("Model-fit model scope: ", paste(model_fit_models, collapse = ", "))
 
-  for (v in model_fit_variables) {
+  total_fit_variables <- length(model_fit_variables)
+  for (var_idx in seq_along(model_fit_variables)) {
+    v <- model_fit_variables[[var_idx]]
+    progress_step(
+      stage = "model_fit:variables",
+      current = var_idx,
+      total = total_fit_variables,
+      detail = v
+    )
     trait <- X[[v]]
     names(trait) <- rownames(X)
     trait <- trait[tree_pruned$tip.label]
@@ -2667,7 +2962,15 @@ if (reuse_named_root_reconstruction) {
   message("Reconstructing primary root states in original climate variables.")
 
   root_rows <- list()
-  for (v in climate_vars) {
+  total_root_variables <- length(climate_vars)
+  for (root_idx in seq_along(climate_vars)) {
+    v <- climate_vars[[root_idx]]
+    progress_step(
+      stage = "root_reconstruction:primary",
+      current = root_idx,
+      total = total_root_variables,
+      detail = v
+    )
     trait <- X[[v]]
     names(trait) <- rownames(X)
     trait <- trait[tree_pruned$tip.label]
@@ -2697,7 +3000,14 @@ if (reuse_named_root_reconstruction) {
   primary_root <- bind_rows(root_rows)
 
   sensitivity_rows <- list()
-  for (v in climate_vars) {
+  for (sens_idx in seq_along(climate_vars)) {
+    v <- climate_vars[[sens_idx]]
+    progress_step(
+      stage = "root_reconstruction:sensitivity",
+      current = sens_idx,
+      total = total_root_variables,
+      detail = v
+    )
     trait <- X[[v]]
     names(trait) <- rownames(X)
     trait <- trait[tree_pruned$tip.label]
@@ -2920,6 +3230,7 @@ projected_root_point <- projected_root_point %>%
     density_percentile_against_extant_distribution_displayed_2D = biological_density_diagnostics$density_percentile,
     density_classification_displayed_2D = biological_density_diagnostics$density_classification
   )
+density_diagnostics <- biological_density_diagnostics
 
 uncertainty_projection <- project_root_uncertainty_to_pca(
   root_projection_table,
@@ -3337,16 +3648,24 @@ if (save_intermediate_rds) {
 }
 
 if (!skip_plots && pipeline_stage %in% c("all", "plot")) {
-  make_plot(
+  make_pca_plot(
     scores_out = scores_out,
     root_point = projected_root_point,
     ellipse_df = ellipse_df,
-    loadings = pca_obj$loadings,
+    loadings = biological_view$loadings_out,
     core_membership = core_membership,
     eigenvalues = pca_obj$eigenvalues,
-    pca_obj = pca_obj,
+    axis_x = biological_view$axis_x,
+    axis_y = biological_view$axis_y,
     projection = projection,
-    density_surface = density_diagnostics$density_surface
+    density_surface = density_diagnostics$density_surface,
+    xlab_txt = paste0("Display PC", biological_view$axis_x, " (oriented)"),
+    ylab_txt = paste0("Display PC", biological_view$axis_y, " (oriented)"),
+    title_txt = "Result Block 1: projected ancestral root in visualization PCA space",
+    subtitle_txt = "Root reconstructed in original climate variables; PCA used only for visualization",
+    output_png = file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.png"),
+    output_pdf = file.path(output_dir, "ancestral_root_projected_PCA_strict_plot.pdf"),
+    write_annotation_csv = TRUE
   )
 
   if (using_named_downstream_model_set) {
