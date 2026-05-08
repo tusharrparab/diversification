@@ -44,17 +44,11 @@ on:
         options:
           - all
           - annual_mean_temperature
-          - annual_precipitation
-          - maximum_temperature_warmest_month
-          - mean_temperature_coldest_quarter
-          - mean_temperature_driest_quarter
           - minimum_temperature_coldest_month
-          - precipitation_in_coldest_quarter
+          - temperature_seasonality
+          - annual_precipitation
           - precipitation_of_coldest_quarter
           - precipitation_of_wettest_quarter
-          - precipitation_wettest_month
-          - temperature_annual_range
-          - temperature_seasonality
       model_fit_model:
         description: "For stage=model_fit only: fit one candidate model for the selected variable, or all candidate models."
         required: true
